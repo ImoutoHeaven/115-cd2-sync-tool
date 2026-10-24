@@ -1,0 +1,21 @@
+# extracted installer, decompiler output, IDA databases
+/out/
+*.i64
+*.id0
+*.id1
+*.id2
+*.nam
+*.til
+*.exe
+
+# python
+__pycache__/
+*.pyc
+.venv/
+
+# runtime state
+manifest*.jsonl
+
+# dumper build output
+/tools/dumper/bin/
+/tools/dumper/obj/
