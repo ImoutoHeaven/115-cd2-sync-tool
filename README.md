@@ -58,7 +58,7 @@ python cd2_stream.py clean --dest /115 --yes
 - `--stall`: Seconds before requeuing a vanished submitted task, or marking an un-clearable landed file as stranded. Default: `300.0`.
 - `--retry-after`: Seconds to wait before restarting a failed task. Default: `180.0`.
 - `--max-attempts`: Maximum submission or restart attempts before parking a record in `failed` state. Default: `5`.
-- `--delete`: Post-landing cleanup mode: `recycle` (default, moves file to 115 recycle bin via `DeleteFile`), `permanent` (deletes permanently via `DeleteFilePermanently`), or `none` (leaves files in place on 115, recorded as `kept`).
+- `--delete`: Post-landing cleanup mode: `recycle` (default, `DeleteFile` into the cloud recycle bin), `permanent` (`DeleteFilePermanently`, only when that file has `canDeletePermanently`), or `none` (leave the file, record `kept`).
 - `--expect-cloud`: Case-insensitive regular expression required to match the destination cloud driver name. Default: `115`. Prevents writes if `--dest` does not point to the expected cloud provider.
 - `--yes`: Confirms deletion for the `clean` subcommand.
 

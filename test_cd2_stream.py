@@ -32,6 +32,8 @@ class FakeCD2:
         self.files = {}             # path -> size on the current account
         self.task_rows = {}         # sourcePath -> CopyTask
         self.copies, self.restarts, self.deleted, self.events = [], [], [], []
+        self.delete_permanent = []
+        self.can_delete_permanently = False
 
     def keep_login(self):
         pass
@@ -51,12 +53,16 @@ class FakeCD2:
         if self.dead:
             raise Expired()
         size = self.files.get(path)
-        return None if size is None else pb.CloudDriveFile(name=path.rsplit("/", 1)[1], size=size)
+        return None if size is None else pb.CloudDriveFile(
+            name=path.rsplit("/", 1)[1], size=size,
+            canDeletePermanently=self.can_delete_permanently,
+        )
 
     def delete(self, path, permanent=False):
         if self.dead:
             raise Expired()
         self.deleted.append(path)
+        self.delete_permanent.append(permanent)
         self.events.append("delete")
         self.files.pop(path, None)
         return pb.FileOperationResult(success=True)
@@ -199,7 +205,17 @@ class PipelineTest(unittest.TestCase):
         p = self.pipeline(["a"])
         p.step()
         self.assertEqual(cd2.deleted, [f"{DEST}/a"])
+        self.assertEqual(cd2.delete_permanent, [False])
         self.assertEqual(cd2.copies, ["/src/d/a"])
+
+    def test_same_named_file_blocks_when_permanent_is_unsupported(self):
+        cd2 = self.cd2
+        cd2.files[f"{DEST}/a"] = 7
+        p = self.pipeline(["a"], delete="permanent", max_attempts=1)
+        p.step()
+        self.assertEqual(cd2.deleted, [])
+        self.assertEqual(cd2.copies, [])
+        self.assertEqual(self.state_of(p, "a"), "failed")
 
     def test_foreign_completed_task_does_not_count_for_a_parked_file(self):
         cd2 = self.cd2
@@ -220,6 +236,27 @@ class PipelineTest(unittest.TestCase):
         cd2.events.clear()
         p.step()
         self.assertEqual(cd2.events, ["delete", "restart"])
+        self.assertEqual(cd2.delete_permanent, [False])
+
+    def test_permanent_delete_is_refused_without_engine_flag(self):
+        cd2 = self.cd2
+        p = self.pipeline(["a"], delete="permanent", stall=0)
+        p.step()
+        cd2.finish("/src/d/a")
+        p.step()
+        self.assertEqual(cd2.deleted, [])
+        self.assertEqual(self.state_of(p, "a"), "stranded")
+
+    def test_permanent_delete_when_engine_allows_it(self):
+        cd2 = self.cd2
+        cd2.can_delete_permanently = True
+        p = self.pipeline(["a"], delete="permanent")
+        p.step()
+        cd2.finish("/src/d/a")
+        p.step()
+        self.assertEqual(cd2.deleted, [f"{DEST}/a"])
+        self.assertEqual(cd2.delete_permanent, [True])
+        self.assertEqual(self.state_of(p, "a"), "dropped")
 
     def test_subfolder_dest_that_cannot_be_created_is_not_ready(self):
         man = Manifest(self.state, "/src", "/115/inbox")

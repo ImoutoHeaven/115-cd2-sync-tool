@@ -248,6 +248,13 @@ class CD2:
         return self._call(m, pb.FileRequest(path=path), timeout=300)
 
 
+def delete_on_dest(ctl, path, permanent, can_delete_permanently):
+    """Recycle is DeleteFile. Permanent is DeleteFilePermanently only when the engine set the file flag."""
+    if permanent and not can_delete_permanently:
+        return pb.FileOperationResult(success=False, errorMessage="permanent delete is not supported for this file")
+    return ctl.delete(path, permanent=permanent)
+
+
 class Manifest:
     """Append-only JSONL, last line per `rel` wins.
 
@@ -423,7 +430,7 @@ class Pipeline:
                 return self._done(r, "dropped", f"gone already {r['rel']}")
             if f.isDirectory or f.size != r["size"]:
                 return self._done(r, "stranded", f"{r['rel']} landed under another name; left on 115")
-            res = self.ctl.delete(path, permanent=(self.a.delete == "permanent"))
+            res = delete_on_dest(self.ctl, path, self.a.delete == "permanent", f.canDeletePermanently)
         except grpc.RpcError as e:
             return r, False, f"{e.code().name} {e.details()}"
         if not res.success:
@@ -538,7 +545,7 @@ class Pipeline:
                     self.bump(r, f"a directory owns {base_of(stale)} in {self.man.dest_root}")
                     continue
                 if f is not None and self.a.delete != "none":
-                    res = self.ctl.delete(stale, permanent=(self.a.delete == "permanent"))
+                    res = delete_on_dest(self.ctl, stale, self.a.delete == "permanent", f.canDeletePermanently)
                     if not res.success:
                         self.bump(r, f"cannot clear {base_of(stale)}: {res.errorMessage}")
                         continue
@@ -723,7 +730,7 @@ def main():
     ap.add_argument("--retry-after", type=float, default=180.0, help="wait this long before restarting a Failed task")
     ap.add_argument("--max-attempts", type=int, default=5)
     ap.add_argument("--delete", default="recycle", choices=["recycle", "permanent", "none"],
-                    help="what to do with the file after it lands on 115")
+                    help="after landing: recycle = DeleteFile; permanent = DeleteFilePermanently only if the engine set canDeletePermanently; none = leave it")
     ap.add_argument("--yes", action="store_true", help="clean: actually delete")
     ap.add_argument("--expect-cloud", default="115",
                     help="refuse to run unless --dest sits on a cloud whose name matches this regex")
@@ -748,7 +755,7 @@ def main():
             return 0
         bad = 0
         for f in files:
-            res = ctl.delete(f.fullPathName, permanent=(a.delete == "permanent"))
+            res = delete_on_dest(ctl, f.fullPathName, a.delete == "permanent", f.canDeletePermanently)
             if not res.success:
                 bad += 1
                 log(f"  refused {f.name}: {res.errorMessage}")
