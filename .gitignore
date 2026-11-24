@@ -15,6 +15,7 @@ __pycache__/
 
 # runtime state
 manifest*.jsonl
+manifest*.jsonl.lock
 
 # dumper build output
 /tools/dumper/bin/
