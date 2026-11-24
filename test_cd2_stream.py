@@ -415,63 +415,180 @@ class MissingGraceTest(PipelineTestBase):
         ctl.list_dir.assert_not_called()
 
 
-class PushTaskChangeListenerTest(PipelineTestBase):
+class PushMessageListenerTest(PipelineTestBase):
     def test_should_wake_filters_precisely(self):
         man = self.make_man()
         ctl = make_fake_ctl()
         cfg = make_cfg(self.state_path)
         pipe = Pipeline(ctl, man, cfg)
 
-        # Initial snapshot with copyTaskCount=3, no finish -> initialize only, no wake
-        self.assertFalse(pipe._should_wake(pb.GetAllTasksCountResult(copyTaskCount=3)))
+        # Initial COPY_TASK_COUNT snapshot with copyTaskCount=3, no finish -> initialize only, no wake
+        self.assertFalse(
+            pipe._should_wake(
+                pb.CloudDrivePushMessage(
+                    messageType=pb.CloudDrivePushMessage.COPY_TASK_COUNT,
+                    transferTaskStatus=pb.TransferTaskStatus(copyTaskCount=3),
+                )
+            )
+        )
         # Same copyTaskCount=3 (unrelated download tick) -> no wake
-        self.assertFalse(pipe._should_wake(pb.GetAllTasksCountResult(downloadCount=5, copyTaskCount=3)))
+        self.assertFalse(
+            pipe._should_wake(
+                pb.CloudDrivePushMessage(
+                    messageType=pb.CloudDrivePushMessage.DOWNLOADER_COUNT,
+                    transferTaskStatus=pb.TransferTaskStatus(downloadCount=5, copyTaskCount=3),
+                )
+            )
+        )
         # Transfer+Copy -> no wake
         self.assertFalse(
             pipe._should_wake(
-                pb.GetAllTasksCountResult(
-                    copyTaskCount=3,
-                    uploadFileStatusChanges=[
-                        pb.UploadFileInfo(
-                            statusEnum=pb.UploadFileInfo.Transfer,
-                            operatorType=pb.UploadFileInfo.Copy,
-                        )
-                    ],
+                pb.CloudDrivePushMessage(
+                    messageType=pb.CloudDrivePushMessage.UPLOADER_COUNT,
+                    transferTaskStatus=pb.TransferTaskStatus(
+                        copyTaskCount=3,
+                        uploadFileStatusChanges=[
+                            pb.UploadFileInfo(
+                                statusEnum=pb.UploadFileInfo.Transfer,
+                                operatorType=pb.UploadFileInfo.Copy,
+                            )
+                        ],
+                    ),
                 )
             )
         )
         # Finish+Mount -> no wake
         self.assertFalse(
             pipe._should_wake(
-                pb.GetAllTasksCountResult(
-                    copyTaskCount=3,
-                    uploadFileStatusChanges=[
-                        pb.UploadFileInfo(
-                            statusEnum=pb.UploadFileInfo.Finish,
-                            operatorType=pb.UploadFileInfo.Mount,
-                        )
-                    ],
+                pb.CloudDrivePushMessage(
+                    messageType=pb.CloudDrivePushMessage.UPLOADER_COUNT,
+                    transferTaskStatus=pb.TransferTaskStatus(
+                        copyTaskCount=3,
+                        uploadFileStatusChanges=[
+                            pb.UploadFileInfo(
+                                statusEnum=pb.UploadFileInfo.Finish,
+                                operatorType=pb.UploadFileInfo.Mount,
+                            )
+                        ],
+                    ),
                 )
             )
         )
-        # Finish+Copy -> wake!
+        # Finish+Copy on UPLOADER_COUNT -> wake!
         self.assertTrue(
             pipe._should_wake(
-                pb.GetAllTasksCountResult(
-                    copyTaskCount=3,
-                    uploadFileStatusChanges=[
-                        pb.UploadFileInfo(
-                            statusEnum=pb.UploadFileInfo.Finish,
-                            operatorType=pb.UploadFileInfo.Copy,
-                        )
-                    ],
+                pb.CloudDrivePushMessage(
+                    messageType=pb.CloudDrivePushMessage.UPLOADER_COUNT,
+                    transferTaskStatus=pb.TransferTaskStatus(
+                        copyTaskCount=3,
+                        uploadFileStatusChanges=[
+                            pb.UploadFileInfo(
+                                statusEnum=pb.UploadFileInfo.Finish,
+                                operatorType=pb.UploadFileInfo.Copy,
+                            )
+                        ],
+                    ),
                 )
             )
         )
-        # copyTaskCount delta (3 -> 2) -> wake!
-        self.assertTrue(pipe._should_wake(pb.GetAllTasksCountResult(copyTaskCount=2)))
+        # copyTaskCount delta (3 -> 2) on COPY_TASK_COUNT -> wake!
+        self.assertTrue(
+            pipe._should_wake(
+                pb.CloudDrivePushMessage(
+                    messageType=pb.CloudDrivePushMessage.COPY_TASK_COUNT,
+                    transferTaskStatus=pb.TransferTaskStatus(copyTaskCount=2),
+                )
+            )
+        )
 
-    def test_listen_cancel_on_stop_and_auth_expired_exits(self):
+        # FILE_SYSTEM_CHANGE(CREATE) regular file under dest_root -> wake!
+        self.assertTrue(
+            pipe._should_wake(
+                pb.CloudDrivePushMessage(
+                    messageType=pb.CloudDrivePushMessage.FILE_SYSTEM_CHANGE,
+                    fileSystemChange=pb.FileSystemChange(
+                        changeType=pb.FileSystemChange.CREATE,
+                        isDirectory=False,
+                        path="/115/landed.mkv",
+                    ),
+                )
+            )
+        )
+        # FILE_SYSTEM_CHANGE(CREATE) directory under dest_root -> no wake
+        self.assertFalse(
+            pipe._should_wake(
+                pb.CloudDrivePushMessage(
+                    messageType=pb.CloudDrivePushMessage.FILE_SYSTEM_CHANGE,
+                    fileSystemChange=pb.FileSystemChange(
+                        changeType=pb.FileSystemChange.CREATE,
+                        isDirectory=True,
+                        path="/115/subdir",
+                    ),
+                )
+            )
+        )
+        # FILE_SYSTEM_CHANGE(DELETE) under dest_root -> no wake
+        self.assertFalse(
+            pipe._should_wake(
+                pb.CloudDrivePushMessage(
+                    messageType=pb.CloudDrivePushMessage.FILE_SYSTEM_CHANGE,
+                    fileSystemChange=pb.FileSystemChange(
+                        changeType=pb.FileSystemChange.DELETE,
+                        isDirectory=False,
+                        path="/115/landed.mkv",
+                    ),
+                )
+            )
+        )
+        # FILE_SYSTEM_CHANGE(CREATE) outside dest_root (or prefix collision /1150/...) -> no wake
+        for other_path in ("/123/a.mkv", "/1150/a.mkv"):
+            self.assertFalse(
+                pipe._should_wake(
+                    pb.CloudDrivePushMessage(
+                        messageType=pb.CloudDrivePushMessage.FILE_SYSTEM_CHANGE,
+                        fileSystemChange=pb.FileSystemChange(
+                            changeType=pb.FileSystemChange.CREATE,
+                            isDirectory=False,
+                            path=other_path,
+                        ),
+                    )
+                )
+            )
+
+        # MOUNT_POINT_CHANGE and CLOUD_API_CHANGE invalidate dest_ready cache and wake
+        for mtype in (
+            pb.CloudDrivePushMessage.MOUNT_POINT_CHANGE,
+            pb.CloudDrivePushMessage.CLOUD_API_CHANGE,
+        ):
+            pipe._dest_checked_at = 1234.5
+            self.assertTrue(pipe._should_wake(pb.CloudDrivePushMessage(messageType=mtype)))
+            self.assertEqual(pipe._dest_checked_at, 0.0)
+
+        # FORCE_EXIT logs message and does not wake
+        with patch("cd2_pipeline.log") as mock_log:
+            self.assertFalse(
+                pipe._should_wake(
+                    pb.CloudDrivePushMessage(
+                        messageType=pb.CloudDrivePushMessage.FORCE_EXIT,
+                        exitedMessage=pb.ExitedMessage(
+                            exitReason=pb.ExitedMessage.SHUTDOWN,
+                            message="server shutting down",
+                        ),
+                    )
+                )
+            )
+            self.assertTrue(
+                any("FORCE_EXIT" in str(c.args[0]) and "server shutting down" in str(c.args[0]) for c in mock_log.call_args_list)
+            )
+
+        # Unrelated message types -> no wake
+        self.assertFalse(
+            pipe._should_wake(
+                pb.CloudDrivePushMessage(messageType=pb.CloudDrivePushMessage.LOG_MESSAGE)
+            )
+        )
+
+    def test_listen_cancel_on_stop_auth_expired_and_unimplemented_exits(self):
         man = self.make_man()
         ctl = make_fake_ctl()
         cfg = make_cfg(self.state_path)
@@ -484,21 +601,24 @@ class PushTaskChangeListenerTest(PipelineTestBase):
         class FakeStream:
             def __iter__(self):
                 entered.set()
-                yield pb.GetAllTasksCountResult(
-                    copyTaskCount=1,
-                    uploadFileStatusChanges=[
-                        pb.UploadFileInfo(
-                            statusEnum=pb.UploadFileInfo.Finish,
-                            operatorType=pb.UploadFileInfo.Copy,
-                        )
-                    ],
+                yield pb.CloudDrivePushMessage(
+                    messageType=pb.CloudDrivePushMessage.COPY_TASK_COUNT,
+                    transferTaskStatus=pb.TransferTaskStatus(
+                        copyTaskCount=1,
+                        uploadFileStatusChanges=[
+                            pb.UploadFileInfo(
+                                statusEnum=pb.UploadFileInfo.Finish,
+                                operatorType=pb.UploadFileInfo.Copy,
+                            )
+                        ],
+                    ),
                 )
                 cancelled.wait(timeout=2.0)
 
             def cancel(self):
                 cancelled.set()
 
-        ctl.push_task_changes.return_value = FakeStream()
+        ctl.push_messages.return_value = FakeStream()
         t = threading.Thread(target=pipe.listen, daemon=True)
         t.start()
         self.assertTrue(entered.wait(timeout=2.0))
@@ -512,10 +632,85 @@ class PushTaskChangeListenerTest(PipelineTestBase):
 
         # AuthExpiredError stops listener and sets stop + _auth_error
         pipe2 = Pipeline(ctl, man, cfg)
-        ctl.push_task_changes.side_effect = AuthExpiredError("expired")
+        ctl.push_messages.side_effect = AuthExpiredError("expired")
         pipe2.listen()
         self.assertTrue(pipe2.stop.is_set())
         self.assertIsInstance(pipe2._auth_error, AuthExpiredError)
+
+        # UNIMPLEMENTED logs once and exits listener immediately without retrying or stopping pipeline
+        ctl3 = make_fake_ctl()
+        ctl3.push_messages.side_effect = FakeRpcError(
+            grpc.StatusCode.UNIMPLEMENTED, "not implemented"
+        )
+        pipe3 = Pipeline(ctl3, man, cfg)
+        with patch("cd2_pipeline.log") as mock_log:
+            pipe3.listen()
+        self.assertEqual(ctl3.push_messages.call_count, 1)
+        self.assertFalse(pipe3.stop.is_set())
+        self.assertIsNone(pipe3._auth_error)
+        self.assertTrue(
+            any("unimplemented" in str(c.args[0]).lower() for c in mock_log.call_args_list)
+        )
+
+    def test_mount_or_cloud_api_change_forces_slow_step_within_sweep_window(self):
+        for mtype in (
+            pb.CloudDrivePushMessage.MOUNT_POINT_CHANGE,
+            pb.CloudDrivePushMessage.CLOUD_API_CHANGE,
+        ):
+            with self.subTest(message_type=mtype):
+                state = os.path.join(self.tmp.name, f"m_force_slow_{mtype}.jsonl")
+                man = Manifest(state, "/123", "/115")
+                self.addCleanup(man.close)
+                r = man.add(make_file("/123/a.mkv", size=100))
+                ctl = make_fake_ctl()
+                cfg = make_cfg(state, "--sweep", "60", "--delete-interval", "60")
+                pipe = Pipeline(ctl, man, cfg)
+                pipe.DEBOUNCE_SECS = 0.01
+
+                first_step_done = threading.Event()
+                cancelled = threading.Event()
+
+                class FakeStream:
+                    def __iter__(self):
+                        first_step_done.wait(timeout=2.0)
+                        yield pb.CloudDrivePushMessage(messageType=mtype)
+                        cancelled.wait(timeout=2.0)
+
+                    def cancel(self):
+                        cancelled.set()
+
+                ctl.push_messages.return_value = FakeStream()
+
+                orig_slow = pipe.slow_step
+                orig_dest_ready = pipe.dest_ready
+                slow_calls: list[bool] = []
+                dest_ready_forces: list[bool] = []
+
+                def tracked_dest_ready(force: bool = False):
+                    dest_ready_forces.append(force)
+                    return orig_dest_ready(force=force)
+
+                def tracked_slow_step(force_dest: bool = False):
+                    slow_calls.append(force_dest)
+                    orig_slow(force_dest=force_dest)
+                    if len(slow_calls) == 1:
+                        first_step_done.set()
+                    else:
+                        man.set(r, "dropped")
+
+                with patch.object(pipe, "dest_ready", side_effect=tracked_dest_ready), patch.object(
+                    pipe, "slow_step", side_effect=tracked_slow_step
+                ), patch.object(pipe, "fast_step") as mock_fast:
+                    t0 = time.monotonic()
+                    rc = pipe.run()
+                    elapsed = time.monotonic() - t0
+
+                self.assertEqual(rc, 0)
+                self.assertLess(elapsed, 2.0)
+                mock_fast.assert_not_called()
+                self.assertEqual(slow_calls, [False, True])
+                self.assertEqual(dest_ready_forces, [False, True])
+                self.assertFalse(pipe._slow_requested.is_set())
 
 
 class AccountRotationTest(PipelineTestBase):
@@ -916,7 +1111,7 @@ class StateMachineHardeningTest(PipelineTestBase):
 
         step_calls = 0
 
-        def fake_slow_step():
+        def fake_slow_step(force_dest: bool = False):
             nonlocal step_calls
             step_calls += 1
             if step_calls == 1:

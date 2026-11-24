@@ -108,7 +108,7 @@ message CopyTask {
 | `ForceExpireDirCache` | `FileRequest` | `google.protobuf.Empty` | Explicitly expires cached directory entries for a path |
 | `DeleteFile` / `DeleteFilePermanently` | `FileRequest` | `FileOperationResult` | Single-file delete (recycle bin or permanent) |
 | `DeleteFiles` / `DeleteFilesPermanently` | `MultiFileRequest` | `FileOperationResult` | Batch multi-file delete (recycle bin or permanent) |
-| `PushTaskChange` | `google.protobuf.Empty` | `stream GetAllTasksCountResult` | Server-streaming notifications of download/upload/copy task counts and `uploadFileStatusChanges` |
+| `PushMessage` | `google.protobuf.Empty` | `stream CloudDrivePushMessage` | Official server-streaming notifications (`transferTaskStatus`, `fileSystemChange`, `mountPointChange`, `cloudApiChange`, `exitedMessage`); note: `PushTaskChange` returns `UNIMPLEMENTED` in CloudDrive2 1.1.3-3 |
 
 ## 115open Deletion, Throttling, and Directory Cache Internals (`cloudapi.dll`)
 
@@ -142,11 +142,11 @@ Consequently, `FindFileByPath` + `DeleteFiles` can operate directly against the 
 
 The transfer pump is split into five modules (`cd2_core.py`, `cd2_client.py`, `cd2_manifest.py`, `cd2_pipeline.py`, `cd2_stream.py`) driving CloudDrive2 without modifying the source tree.
 
-### Dual-Cadence Loop and Filtered `PushTaskChange`
+### Dual-Cadence Loop and Filtered `PushMessage`
 
 - **Fast Delete Cadence (`--delete-interval`, default `2.5`s)**: Drains `landed` records frequently so 115 space is reclaimed continuously via batch `DeleteFiles` calls without waiting for the slower sweep timer.
 - **Slow Sweep Cadence (`--sweep`, default `20.0`s)**: Reconciles `GetCopyTasks` state, prunes completed tasks, submits new `CopyFile` tasks, and restarts eligible failed tasks.
-- **Precise `PushTaskChange` Filtering**: A background daemon thread listens on `PushTaskChange`. Because `copyTaskCount` remains non-zero whenever *any* copy task exists, raw count ticks are filtered rather than waking the loop unconditionally; only meaningful copy-task count changes or `uploadFileStatusChanges` transitions wake the pipeline, preventing busy-spin RPC loops.
+- **Precise `PushMessage` Filtering**: A background daemon thread listens on `PushMessage` (`stream CloudDrivePushMessage`; note that `PushTaskChange` returns `UNIMPLEMENTED` in CloudDrive2 1.1.3-3). It wakes the pipeline (with 0.3s debounce) only on copy-task count changes or `Finish`+`Copy` `uploadFileStatusChanges` (`COPY_TASK_COUNT` / `UPLOADER_COUNT` / `DOWNLOADER_COUNT`), non-directory `CREATE` events under `dest_root` (`FILE_SYSTEM_CHANGE`), or mount/account changes (`MOUNT_POINT_CHANGE` / `CLOUD_API_CHANGE`, which also invalidate the `dest_ready` cache). If `PushMessage` returns `UNIMPLEMENTED`, the listener exits once and falls back cleanly to the `--delete-interval` / `--sweep` timers.
 
 ### Transfer, Completion, and Restart Semantics
 

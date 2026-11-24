@@ -13,7 +13,7 @@ The project is organized into five focused modules:
 - `cd2_core.py`: Core constants, path/endpoint validation, completion verification (`uploaded`), throttle detection (`is_throttle_error`), `ThrottleGate` (exponential backoff with jitter and AIMD batch-size recovery), and CLI/environment `Config` parsing.
 - `cd2_client.py`: Thin CloudDrive2 gRPC client (`CD2Client`) with explicit local-RPC auth renewal (`AuthExpiredError`), strict `NOT_FOUND` lookups, cached directory walks, and batch `DeleteFiles` / `DeleteFilesPermanently` calls.
 - `cd2_manifest.py`: Append-only JSONL ledger (`Manifest`) with cross-process exclusive locking (`<state>.lock`, `ManifestLockError`), reverse-seek torn-tail crash repair, and batched `fsync` writes.
-- `cd2_pipeline.py`: Dual-cadence transfer engine (`Pipeline`), filtered `PushTaskChange` listener, fast batch-delete cycle with `ThrottleGate` and `--missing-grace`, slow reconciliation/submission/restart sweep, and `clean` runner.
+- `cd2_pipeline.py`: Dual-cadence transfer engine (`Pipeline`), filtered `PushMessage` listener (`PushTaskChange` returns `UNIMPLEMENTED` in CloudDrive2 1.1.3-3), fast batch-delete cycle with `ThrottleGate` and `--missing-grace`, slow reconciliation/submission/restart sweep, and `clean` runner.
 - `cd2_stream.py`: Thin CLI entrypoint dispatching `scan`, `run`, and `clean`.
 
 ## Requirements
@@ -48,7 +48,7 @@ python cd2_stream.py clean --dest /115 --yes
 ### Commands
 
 - `scan`: Walks the source tree using cached `GetSubFiles`, updates the local manifest, and prints a status preview of pending and completed files.
-- `run`: Executes the dual-cadence pipeline loop. Scans source files, submits tasks (holding back any file whose basename is already in flight), monitors task progression via `PushTaskChange` and periodic sweeps, batch-cleans landed files from 115, and handles retries until all files are transferred.
+- `run`: Executes the dual-cadence pipeline loop. Scans source files, submits tasks (holding back any file whose basename is already in flight), monitors task progression and destination changes via `PushMessage` (`PushTaskChange` returns `UNIMPLEMENTED` in CloudDrive2 1.1.3-3) and periodic sweeps, batch-cleans landed files from 115, and handles retries until all files are transferred.
 - `clean`: Lists or deletes every non-directory file directly under `--dest`, regardless of the manifest or origin. On a mount root (e.g. `/115`), this targets every root file. Supports `--delete recycle` (default) and `--delete permanent`; `--delete none` is rejected. Defaults to dry run; `--yes` confirms deletion, which executes via chunked `DeleteFiles` / `DeleteFilesPermanently` batches with `ThrottleGate` rate-limit backoff.
 
 ### Options

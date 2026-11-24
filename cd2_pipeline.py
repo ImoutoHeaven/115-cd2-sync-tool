@@ -102,6 +102,7 @@ class Pipeline:
         self._wake_lock = threading.Lock()
         self._debounce_timer: threading.Timer | None = None
         self._last_copy_count: int | None = None
+        self._slow_requested = threading.Event()
 
     def _rt_of(self, rel: str) -> dict:
         return self._rt.setdefault(rel, {})
@@ -109,18 +110,54 @@ class Pipeline:
     def invalidate_dest_cache(self) -> None:
         self._dest_checked_at = 0.0
 
-    # --- PushTaskChange listener -------------------------------------------
+    # --- PushMessage listener ----------------------------------------------
 
-    def _should_wake(self, msg) -> bool:
-        finish_copy = any(
-            u.statusEnum == pb.UploadFileInfo.Finish
-            and u.operatorType == pb.UploadFileInfo.Copy
-            for u in msg.uploadFileStatusChanges
-        )
-        count = msg.copyTaskCount
-        count_changed = self._last_copy_count is not None and count != self._last_copy_count
-        self._last_copy_count = count
-        return finish_copy or count_changed
+    def _should_wake(self, msg: pb.CloudDrivePushMessage) -> bool:
+        mtype = msg.messageType
+        if mtype in (
+            pb.CloudDrivePushMessage.COPY_TASK_COUNT,
+            pb.CloudDrivePushMessage.UPLOADER_COUNT,
+            pb.CloudDrivePushMessage.DOWNLOADER_COUNT,
+        ) and msg.HasField("transferTaskStatus"):
+            status = msg.transferTaskStatus
+            finish_copy = any(
+                u.statusEnum == pb.UploadFileInfo.Finish
+                and u.operatorType == pb.UploadFileInfo.Copy
+                for u in status.uploadFileStatusChanges
+            )
+            count = status.copyTaskCount
+            count_changed = (
+                self._last_copy_count is not None and count != self._last_copy_count
+            )
+            self._last_copy_count = count
+            return finish_copy or count_changed
+
+        if (
+            mtype == pb.CloudDrivePushMessage.FILE_SYSTEM_CHANGE
+            and msg.HasField("fileSystemChange")
+        ):
+            fsc = msg.fileSystemChange
+            dest_prefix = f"{self.man.dest_root.rstrip('/')}/"
+            return (
+                fsc.changeType == pb.FileSystemChange.CREATE
+                and not fsc.isDirectory
+                and fsc.path.startswith(dest_prefix)
+            )
+
+        if mtype in (
+            pb.CloudDrivePushMessage.MOUNT_POINT_CHANGE,
+            pb.CloudDrivePushMessage.CLOUD_API_CHANGE,
+        ):
+            self.invalidate_dest_cache()
+            self._slow_requested.set()
+            return True
+
+        if mtype == pb.CloudDrivePushMessage.FORCE_EXIT:
+            detail = msg.exitedMessage.message if msg.HasField("exitedMessage") else ""
+            log(f"push listener received FORCE_EXIT{f': {detail}' if detail else ''}")
+            return False
+
+        return False
 
     def _fire_wake(self) -> None:
         if not self.stop.is_set():
@@ -161,7 +198,7 @@ class Pipeline:
         while not self.stop.is_set():
             stream = None
             try:
-                stream = self.ctl.push_task_changes()
+                stream = self.ctl.push_messages()
                 with self._stream_lock:
                     if self.stop.is_set():
                         cancel = getattr(stream, "cancel", None)
@@ -184,9 +221,15 @@ class Pipeline:
             except grpc.RpcError as e:
                 if self.stop.is_set():
                     return
+                if e.code() == grpc.StatusCode.UNIMPLEMENTED:
+                    log(
+                        f"PushMessage is unimplemented ({e.details()}); "
+                        f"disabling push listener and falling back to timers"
+                    )
+                    return
                 if e.code() == grpc.StatusCode.UNAUTHENTICATED and not self.ctl.creds:
                     err = AuthExpiredError(
-                        f"PushTaskChange unauthorized without stored credentials: {e.details()}"
+                        f"PushMessage unauthorized without stored credentials: {e.details()}"
                     )
                     log(f"push listener stopped: {err}")
                     self._auth_error = err
@@ -873,12 +916,12 @@ class Pipeline:
             self.clear_landed()
         self.prune_done()
 
-    def slow_step(self) -> None:
+    def slow_step(self, force_dest: bool = False) -> None:
         self.more = False
         self.due = []
         self._rotated_this_step = False
         self.ctl.keep_login()
-        why = self.dest_ready()
+        why = self.dest_ready(force=force_dest)
         if why != self.why:
             log(f"dest {self.man.dest_root}: {why or 'ready'}")
             self.why = why
@@ -913,9 +956,12 @@ class Pipeline:
         try:
             while not self.stop.is_set():
                 self.trigger.clear()
+                force_slow = self._slow_requested.is_set()
+                if force_slow:
+                    self._slow_requested.clear()
                 now = time.monotonic()
-                if self.more or now >= next_slow:
-                    self.slow_step()
+                if self.more or force_slow or now >= next_slow:
+                    self.slow_step(force_dest=force_slow)
                     after = time.monotonic()
                     next_slow = after + self.cfg.sweep
                     next_fast = after + self.cfg.delete_interval

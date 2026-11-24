@@ -348,8 +348,8 @@ class CD2Client:
             ).copyTasks
         )
 
-    def push_task_changes(self):
-        return self.stub.PushTaskChange(empty_pb2.Empty(), metadata=self._md())
+    def push_messages(self):
+        return self.stub.PushMessage(empty_pb2.Empty(), metadata=self._md())
 
     def close(self) -> None:
         if self.channel is not None:

@@ -447,15 +447,16 @@ class CD2ClientOperationsTest(unittest.TestCase):
         self.assertFalse(ok)
         self.assertEqual(failed, {"k3"})
 
-    def test_push_task_changes_and_close(self):
+    def test_push_messages_and_close(self):
         client, stub, channel = make_client(token="tok-stream")
+        self.assertFalse(hasattr(client, "push_task_changes"))
         stream_obj = MagicMock()
-        stub.PushTaskChange.return_value = stream_obj
+        stub.PushMessage.return_value = stream_obj
 
-        res = client.push_task_changes()
+        res = client.push_messages()
         self.assertIs(res, stream_obj)
         self.assertEqual(
-            stub.PushTaskChange.call_args.kwargs["metadata"],
+            stub.PushMessage.call_args.kwargs["metadata"],
             [("authorization", "Bearer tok-stream")],
         )
 
