@@ -79,7 +79,21 @@ All numeric and string options can also be configured via their corresponding en
 | `--retry-after` | `CD2_RETRY_AFTER` | `180.0` | Seconds to wait before restarting a failed task (`>= 0`). |
 | `--max-attempts` | `CD2_MAX_ATTEMPTS` | `5` | Maximum submission or restart attempts before parking a record in `failed` state (`>= 1`). |
 | `--expect-cloud` | `CD2_EXPECT_CLOUD` | `115` | Case-insensitive regex required to match the destination cloud driver name. |
+| `--daily-limit` | `CD2_DAILY_LIMIT` | `800G` | Per-115-account real-upload quota limit. Decimal by default (`K`/`M`/`G`/`T`, `KB`/`MB`/`GB`/`TB`), explicit binary (`KiB`/`MiB`/`GiB`/`TiB`), or raw integer bytes (`0` = unlimited). |
+| `--quota-window` | `CD2_QUOTA_WINDOW` | `daily-utc8` | Quota accounting window: `daily-utc8` (Beijing time `00:00:00`–`23:59:59`, UTC+8) or `rolling-24h` (sliding 24-hour window). |
+| `--quota-mode` | `CD2_QUOTA_MODE` | `real` | Quota deduction mode: `real` (rapid uploads are free, real uploads and Fail-Closed `unknown` count `size`) or `submitted` (conservative: all confirmed/in-flight files count `size`). |
+| `--max-inflight-bytes` | `CD2_MAX_INFLIGHT_BYTES` | `128G` | Maximum concurrent in-flight reserved bytes per account (`0` = no separate in-flight cap; a solo file still runs when nothing else is in flight). |
+| `--quota-fit` | `CD2_QUOTA_FIT` | `first` | Queue admission policy when remaining quota cannot fit the next file: `first` (First-Fit skips oversized pending files to avoid head-of-line blocking) or `strict` (stop at the first file that does not fit). |
 | `--yes` | — | `false` | Confirms deletion for the `clean` subcommand. |
+
+## 115 Daily Real-Upload Quota Limiting
+
+115 enforces a daily real-upload quota per account (default `800G` decimal = $800 \times 1000^3$ bytes, aligned to UTC+8 `00:00:00`–`23:59:59`), while rapid uploads (秒传) do not consume quota. The pipeline tracks this directly in `manifest.jsonl` (using `landed_at`, `upload_kind`, and `quota_bytes`, with zero extra state files):
+
+- **Reserve-then-Settle Admission**: Before submitting any file, the pipeline enforces `confirmed_real_bytes(account, window) + reserved_inflight_bytes(account) + size <= daily_limit`. Files larger than `--daily-limit` are immediately parked as `failed`. Failed, cancelled, vanished, or rotated-out tasks release their reservation immediately (`quota_bytes = 0`).
+- **Rapid vs Real Detection via `PushMessage`**: Observing `Transfer (3)` or `transferedBytes > 0` in `uploadFileStatusChanges` marks the transfer `real`; reaching `Finish (5)` without ever entering `Transfer (3)` and with `transferedBytes == 0` marks it `rapid`. Missing push telemetry falls back Fail-Closed (`unknown` → counts `size`).
+- **Pre-GC Local `dir_cache` Settlement**: Before batch-deleting landed files (or marking `kept` under `--delete none`), `clear_landed` verifies local `dir_cache` via `FindFileByPath` (never calling `ForceExpireDirCache` or `forceRefresh=True`) and settles `quota_bytes` (`0` for verified `rapid` in `real` mode, `size` otherwise).
+- **Per-Account Isolation & Persistent Foreground Wakeup**: Quotas are isolated by `CloudAPI` identity (`115|<userName>`). When an account reaches its daily limit, submissions and restarts pause while `fast_step()` (aggressive recycle deletion), `keep_login()`, and `dest_ready()` keep running. Swapping to another 115 account resumes immediately; otherwise the pipeline wakes automatically at the next UTC+8 midnight (or when `rolling-24h` frees enough capacity).
 
 ## Aggressive 115 Recycle Deletion
 

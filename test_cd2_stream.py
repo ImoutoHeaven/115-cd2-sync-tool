@@ -1275,5 +1275,625 @@ class RunCleanAndCLITest(PipelineTestBase):
         fake_ctl.close.assert_called_once()
 
 
+class QuotaAndRapidUploadTest(PipelineTestBase):
+    @staticmethod
+    def _push_upload(dest_path: str, status_enum: int, transfered: int = 0, size: int = 100):
+        return pb.CloudDrivePushMessage(
+            messageType=pb.CloudDrivePushMessage.UPLOADER_COUNT,
+            transferTaskStatus=pb.TransferTaskStatus(
+                copyTaskCount=1,
+                uploadFileStatusChanges=[
+                    pb.UploadFileInfo(
+                        destPath=dest_path,
+                        size=size,
+                        transferedBytes=transfered,
+                        operatorType=pb.UploadFileInfo.Copy,
+                        statusEnum=status_enum,
+                    )
+                ],
+            ),
+        )
+
+    def test_reserve_settle_hard_cap_and_oversized_file_parked(self):
+        man = self.make_man()
+        f_huge = man.add(make_file("/123/huge.mkv", size=1200))
+        f1 = man.add(make_file("/123/a.mkv", size=600))
+        f2 = man.add(make_file("/123/b.mkv", size=500))
+        f3 = man.add(make_file("/123/c.mkv", size=400))
+
+        ctl = make_fake_ctl()
+        cfg = make_cfg(
+            self.state_path,
+            "--daily-limit", "1000",
+            "--max-inflight-bytes", "0",
+            "--quota-fit", "first",
+        )
+        t_now = 1_700_000_000.0
+        pipe = Pipeline(ctl, man, cfg, clock=lambda: t_now)
+        pipe.cloud = "115|acc1"
+
+        pipe.submit_pending([])
+        # huge.mkv > 1000 parked immediately; a (600) + c (400) = 1000 <= 1000 (First-Fit skips b=500)
+        self.assertEqual(f_huge["state"], "failed")
+        self.assertEqual(f_huge["quota_bytes"], 0)
+        self.assertEqual(f1["state"], "submitted")
+        self.assertEqual(f2["state"], "pending")
+        self.assertEqual(f3["state"], "submitted")
+        qs = pipe.quota_status("115|acc1", t_now)
+        self.assertEqual(qs.confirmed_real, 0)
+        self.assertEqual(qs.reserved_inflight, 1000)
+
+    def test_quota_fit_strict_blocks_behind_large_file(self):
+        man = self.make_man()
+        f1 = man.add(make_file("/123/a.mkv", size=600))
+        f2 = man.add(make_file("/123/b.mkv", size=500))
+        f3 = man.add(make_file("/123/c.mkv", size=400))
+
+        ctl = make_fake_ctl()
+        cfg = make_cfg(
+            self.state_path,
+            "--daily-limit", "1000",
+            "--max-inflight-bytes", "0",
+            "--quota-fit", "strict",
+        )
+        pipe = Pipeline(ctl, man, cfg, clock=lambda: 1_700_000_000.0)
+        pipe.cloud = "115|acc1"
+
+        pipe.submit_pending([])
+        self.assertEqual(f1["state"], "submitted")
+        self.assertEqual(f2["state"], "pending")
+        self.assertEqual(f3["state"], "pending")
+
+    def test_rapid_free_vs_real_vs_unknown_fail_closed_and_submitted_mode(self):
+        man = self.make_man()
+        r_rapid = man.add(make_file("/123/rapid.mkv", size=500))
+        r_real = man.add(make_file("/123/real.mkv", size=500))
+        r_unk = man.add(make_file("/123/unk.mkv", size=500))
+        r_next = man.add(make_file("/123/next.mkv", size=500))
+
+        ctl = make_fake_ctl()
+        cfg = make_cfg(
+            self.state_path,
+            "--daily-limit", "1000",
+            "--max-inflight-bytes", "0",
+        )
+        t_now = 1_700_000_000.0
+        pipe = Pipeline(ctl, man, cfg, clock=lambda: t_now)
+        pipe.cloud = "115|acc1"
+
+        # Submit first 2 files (1000 B reserved = full cap)
+        pipe.submit_pending([])
+        self.assertEqual(r_rapid["state"], "submitted")
+        self.assertEqual(r_real["state"], "submitted")
+        self.assertEqual(r_unk["state"], "pending")
+
+        # rapid.mkv finishes without Transfer(3) and transferedBytes == 0
+        pipe._should_wake(self._push_upload("/115/rapid.mkv", pb.UploadFileInfo.Finish, transfered=0, size=500))
+        # real.mkv enters Transfer(3) then Finish(5)
+        pipe._should_wake(self._push_upload("/115/real.mkv", pb.UploadFileInfo.Transfer, transfered=200, size=500))
+        pipe._should_wake(self._push_upload("/115/real.mkv", pb.UploadFileInfo.Finish, transfered=500, size=500))
+
+        tasks = [
+            make_task("/123/rapid.mkv", total_bytes=500, uploaded_bytes=500),
+            make_task("/123/real.mkv", total_bytes=500, uploaded_bytes=500),
+        ]
+        pipe.harvest_completed(tasks)
+        # Before dir_cache verification in clear_landed, both are landed & unsettled (still reserved)
+        self.assertEqual(r_rapid["state"], "landed")
+        self.assertEqual(r_rapid["upload_kind"], "rapid")
+        self.assertIsNone(r_rapid["quota_bytes"])
+        self.assertEqual(pipe.quota_status("115|acc1", t_now).reserved_inflight, 1000)
+
+        # Verify local dir_cache hit before DeleteFiles
+        ctl.find.side_effect = lambda p: make_file(p, size=500)
+        pipe.clear_landed()
+        self.assertEqual(r_rapid["state"], "dropped")
+        self.assertEqual(r_rapid["quota_bytes"], 0)
+        self.assertEqual(r_real["state"], "dropped")
+        self.assertEqual(r_real["quota_bytes"], 500)
+        qs = pipe.quota_status("115|acc1", t_now)
+        self.assertEqual(qs.confirmed_real, 500)
+        self.assertEqual(qs.reserved_inflight, 0)
+        self.assertEqual(qs.rapid_saved, 500)
+
+        # Now 500 B is free: unk.mkv submits without any PushMessage -> Fail-Closed counts 500 B
+        ctl.find.side_effect = None
+        ctl.find.return_value = None
+        pipe.submit_pending([])
+        self.assertEqual(r_unk["state"], "submitted")
+        self.assertEqual(r_next["state"], "pending")
+
+        pipe.harvest_completed([make_task("/123/unk.mkv", total_bytes=500, uploaded_bytes=500)])
+        ctl.find.return_value = make_file("/115/unk.mkv", size=500)
+        pipe.clear_landed()
+        self.assertEqual(r_unk["upload_kind"], "unknown")
+        self.assertEqual(r_unk["quota_bytes"], 500)
+        self.assertEqual(pipe.quota_status("115|acc1", t_now).confirmed_real, 1000)
+
+        # Quota now full: r_next cannot submit
+        ctl.find.return_value = None
+        pipe.submit_pending([])
+        self.assertEqual(r_next["state"], "pending")
+
+        # Submitted mode charges even rapid uploads
+        cfg_sub = make_cfg(self.state_path, "--daily-limit", "1000", "--quota-mode", "submitted")
+        pipe_sub = Pipeline(ctl, man, cfg_sub, clock=lambda: t_now)
+        self.assertEqual(pipe_sub._calc_quota_bytes(r_rapid, "rapid"), 500)
+
+    def test_failed_vanished_rejected_release_reservation_zero_quota(self):
+        man = self.make_man()
+        r1 = man.add(make_file("/123/rej.mkv", size=600))
+        r2 = man.add(make_file("/123/van.mkv", size=600))
+
+        ctl = make_fake_ctl()
+        ctl.submit_one.side_effect = [(False, "rejected"), (True, "")]
+        cfg = make_cfg(self.state_path, "--daily-limit", "1000", "--max-inflight-bytes", "0", "--stall", "10")
+        clock = [1000.0]
+        pipe = Pipeline(ctl, man, cfg, clock=lambda: clock[0])
+        pipe.cloud = "115|acc1"
+
+        # r1 rejected -> back to pending with quota_bytes=0
+        pipe.submit_pending([])
+        self.assertEqual(r1["state"], "pending")
+        self.assertEqual(r1["quota_bytes"], 0)
+        self.assertEqual(pipe.quota_status("115|acc1", clock[0]).reserved_inflight, 0)
+
+        # Submit r2, then vanish past stall -> requeued with quota_bytes=0
+        ctl.submit_one.side_effect = None
+        ctl.submit_one.return_value = (True, "")
+        man.set(r1, "dropped", quota_bytes=0, cloud="115|acc1", landed_at=900)
+        pipe.submit_pending([])
+        self.assertEqual(r2["state"], "submitted")
+        self.assertEqual(pipe.quota_status("115|acc1", clock[0]).reserved_inflight, 600)
+
+        clock[0] = 1020.0
+        pipe.reconcile(set())
+        self.assertEqual(r2["state"], "pending")
+        self.assertEqual(r2["quota_bytes"], 0)
+        self.assertEqual(pipe.quota_status("115|acc1", clock[0]).reserved_inflight, 0)
+
+    def test_pre_gc_dir_cache_four_branches_and_delete_none(self):
+        # Branch 1 (--delete none): must call FindFileByPath before marking kept & settling
+        man = self.make_man()
+        r_kept_rapid = man.add(make_file("/123/kept_rapid.mkv", size=300))
+        man.set(r_kept_rapid, "landed", cloud="115|acc1", dest_root="/115", landed_at=100, upload_kind="rapid", quota_bytes=None)
+        ctl = make_fake_ctl()
+        ctl.find.return_value = make_file("/115/kept_rapid.mkv", size=300)
+        cfg_none = make_cfg(self.state_path, "--delete", "none")
+        pipe_none = Pipeline(ctl, man, cfg_none, clock=lambda: 105.0)
+        pipe_none.cloud = "115|acc1"
+        pipe_none.clear_landed()
+        ctl.find.assert_called_once_with("/115/kept_rapid.mkv")
+        ctl.delete_batch.assert_not_called()
+        self.assertEqual(r_kept_rapid["state"], "kept")
+        self.assertEqual(r_kept_rapid["quota_bytes"], 0)
+
+        # Branch 2 (stranded mismatch): rapid -> 0, real -> size
+        r_str_rapid = man.add(make_file("/123/str_rapid.mkv", size=300))
+        r_str_real = man.add(make_file("/123/str_real.mkv", size=400))
+        man.set_batch([
+            (r_str_rapid, "landed", {"cloud": "115|acc1", "dest_root": "/115", "landed_at": 100, "upload_kind": "rapid", "quota_bytes": None}),
+            (r_str_real, "landed", {"cloud": "115|acc1", "dest_root": "/115", "landed_at": 100, "upload_kind": "real", "quota_bytes": None}),
+        ])
+        ctl2 = make_fake_ctl()
+        ctl2.find.side_effect = lambda p: make_file(p, size=999)  # size mismatch
+        pipe = Pipeline(ctl2, man, make_cfg(self.state_path, "--missing-grace", "10"), clock=lambda: 120.0)
+        pipe.cloud = "115|acc1"
+        pipe.clear_landed()
+        self.assertEqual(r_str_rapid["state"], "stranded")
+        self.assertEqual(r_str_rapid["quota_bytes"], 0)
+        self.assertEqual(r_str_real["state"], "stranded")
+        self.assertEqual(r_str_real["quota_bytes"], 400)
+
+        # Branch 3 (NOT_FOUND past missing-grace -> gone already): real -> size, unknown/rapid -> 0
+        r_gone_unk = man.add(make_file("/123/gone_unk.mkv", size=300))
+        r_gone_real = man.add(make_file("/123/gone_real.mkv", size=400))
+        man.set_batch([
+            (r_gone_unk, "landed", {"cloud": "115|acc1", "dest_root": "/115", "landed_at": 100, "upload_kind": "unknown", "quota_bytes": None}),
+            (r_gone_real, "landed", {"cloud": "115|acc1", "dest_root": "/115", "landed_at": 100, "upload_kind": "real", "quota_bytes": None}),
+        ])
+        ctl2.find.side_effect = None
+        ctl2.find.return_value = None
+        pipe.clear_landed()  # miss 1
+        self.assertEqual(r_gone_unk["state"], "landed")
+        pipe.clear_landed()  # miss 2, elapsed 20 >= 10
+        self.assertEqual(r_gone_unk["state"], "dropped")
+        self.assertEqual(r_gone_unk["quota_bytes"], 0)
+        self.assertEqual(r_gone_real["state"], "dropped")
+        self.assertEqual(r_gone_real["quota_bytes"], 400)
+
+        # Branch 4 (cross-account landed guard): dropped without delete, settles quota on original account
+        r_old = man.add(make_file("/123/old_acc.mkv", size=500))
+        man.set(r_old, "landed", cloud="115|acc0", dest_root="/115", landed_at=100, upload_kind="real", quota_bytes=None)
+        pipe.clear_landed()
+        self.assertEqual(r_old["state"], "dropped")
+        self.assertEqual(r_old["quota_bytes"], 500)
+        self.assertEqual(pipe.quota_status("115|acc0", 120.0).confirmed_real, 500)
+        self.assertEqual(pipe.quota_status("115|acc1", 120.0).confirmed_real, 800)
+
+    def test_utc8_midnight_reset_and_rolling_24h_window(self):
+        import datetime
+        from cd2_core import UTC8
+
+        t_before = datetime.datetime(2026, 6, 1, 23, 59, 50, tzinfo=UTC8).timestamp()
+        t_after = datetime.datetime(2026, 6, 2, 0, 0, 5, tzinfo=UTC8).timestamp()
+        clock = [t_before]
+
+        man = self.make_man()
+        r1 = man.add(make_file("/123/d1.mkv", size=1000))
+        r2 = man.add(make_file("/123/d2.mkv", size=500))
+        man.set(r1, "dropped", cloud="115|acc1", dest_root="/115", landed_at=int(t_before - 10), upload_kind="real", quota_bytes=1000)
+
+        ctl = make_fake_ctl()
+        cfg = make_cfg(self.state_path, "--daily-limit", "1000", "--quota-window", "daily-utc8")
+        pipe = Pipeline(ctl, man, cfg, clock=lambda: clock[0])
+        pipe.cloud = "115|acc1"
+
+        pipe.submit_pending([])
+        self.assertEqual(r2["state"], "pending")
+        expected_midnight = datetime.datetime(2026, 6, 2, 0, 0, 0, tzinfo=UTC8).timestamp()
+        self.assertEqual(pipe.next_quota_wakeup("115|acc1", clock[0]), expected_midnight)
+
+        # Cross UTC+8 midnight -> quota resets -> r2 submits
+        clock[0] = t_after
+        pipe.submit_pending([])
+        self.assertEqual(r2["state"], "submitted")
+
+        # Rolling 24h window test
+        man2 = Manifest(os.path.join(self.tmp.name, "m2.jsonl"), "/123", "/115")
+        self.addCleanup(man2.close)
+        a = man2.add(make_file("/123/a.mkv", size=600))
+        b = man2.add(make_file("/123/b.mkv", size=400))
+        c = man2.add(make_file("/123/c.mkv", size=500))
+        man2.set_batch([
+            (a, "dropped", {"cloud": "115|acc1", "dest_root": "/115", "landed_at": 1000, "upload_kind": "real", "quota_bytes": 600}),
+            (b, "dropped", {"cloud": "115|acc1", "dest_root": "/115", "landed_at": 2000, "upload_kind": "real", "quota_bytes": 400}),
+        ])
+        rclock = [5000.0]
+        cfg_r = make_cfg(man2.path, "--daily-limit", "1000", "--quota-window", "rolling-24h")
+        pipe_r = Pipeline(ctl, man2, cfg_r, clock=lambda: rclock[0])
+        pipe_r.cloud = "115|acc1"
+        self.assertEqual(pipe_r.next_quota_wakeup("115|acc1", rclock[0]), 1000.0 + 86400.0)
+        pipe_r.submit_pending([])
+        self.assertEqual(c["state"], "pending")
+        rclock[0] = 1000.0 + 86400.0 + 1.0
+        pipe_r.submit_pending([])
+        self.assertEqual(c["state"], "submitted")
+
+    def test_account_swap_independent_quota_and_no_reupload(self):
+        man = self.make_man()
+        r_done = man.add(make_file("/123/done.mkv", size=1000))
+        r_pend = man.add(make_file("/123/pend.mkv", size=500))
+        man.set(r_done, "dropped", cloud="115|accA", dest_root="/115", landed_at=1000, upload_kind="real", quota_bytes=1000)
+
+        ctl = make_fake_ctl()
+        ctl.cloud_of.return_value = (make_cloud("115", "accA"), None, False)
+        cfg = make_cfg(self.state_path, "--daily-limit", "1000", "--max-inflight-bytes", "0")
+        pipe = Pipeline(ctl, man, cfg, clock=lambda: 1010.0)
+
+        pipe.slow_step(force_dest=True)
+        self.assertEqual(pipe.cloud, "115|accA")
+        self.assertEqual(r_pend["state"], "pending")  # accA is full
+
+        # Swap to accB -> independent quota -> r_pend submits immediately, r_done never re-uploaded
+        ctl.cloud_of.return_value = (make_cloud("115", "accB"), None, False)
+        pipe.slow_step(force_dest=True)
+        self.assertEqual(pipe.cloud, "115|accB")
+        self.assertEqual(r_done["state"], "dropped")
+        self.assertEqual(r_pend["state"], "submitted")
+        self.assertEqual(r_pend["cloud"], "115|accB")
+        ctl.submit_one.assert_called_once_with("/123/pend.mkv", "/115")
+
+    def test_max_inflight_bytes_cap_and_solo_large_file(self):
+        man = self.make_man()
+        f1 = man.add(make_file("/123/f1.mkv", size=100))
+        f2 = man.add(make_file("/123/f2.mkv", size=100))
+        f3 = man.add(make_file("/123/f3.mkv", size=50))
+
+        ctl = make_fake_ctl()
+        cfg = make_cfg(self.state_path, "--daily-limit", "1000", "--max-inflight-bytes", "150", "--quota-fit", "first")
+        pipe = Pipeline(ctl, man, cfg, clock=lambda: 1000.0)
+        pipe.cloud = "115|acc1"
+
+        pipe.submit_pending([])
+        # f1 (100) + f3 (50) = 150 <= 150; f2 (100) skipped because 100+100 > 150
+        self.assertEqual(f1["state"], "submitted")
+        self.assertEqual(f2["state"], "pending")
+        self.assertEqual(f3["state"], "submitted")
+
+        # Solo file > max_inflight_bytes (but <= daily_limit) still runs when reserved == 0
+        man2 = Manifest(os.path.join(self.tmp.name, "solo.jsonl"), "/123", "/115")
+        self.addCleanup(man2.close)
+        f_solo = man2.add(make_file("/123/solo.mkv", size=300))
+        pipe2 = Pipeline(ctl, man2, make_cfg(man2.path, "--daily-limit", "1000", "--max-inflight-bytes", "150"), clock=lambda: 1000.0)
+        pipe2.cloud = "115|acc1"
+        pipe2.submit_pending([])
+        self.assertEqual(f_solo["state"], "submitted")
+
+    def test_crash_restart_restores_quota_from_manifest(self):
+        t_now = 1_700_000_000.0
+        with Manifest(self.state_path, "/123", "/115") as man:
+            r1 = man.add(make_file("/123/a.mkv", size=600))
+            r2 = man.add(make_file("/123/b.mkv", size=300))
+            r3 = man.add(make_file("/123/c.mkv", size=200))
+            man.set_batch([
+                (r1, "dropped", {"cloud": "115|acc1", "dest_root": "/115", "landed_at": int(t_now - 60), "upload_kind": "real", "quota_bytes": 600}),
+                (r2, "submitted", {"cloud": "115|acc1", "dest_root": "/115", "submitted_at": int(t_now - 30), "upload_kind": "", "quota_bytes": None}),
+            ])
+
+        # Reopen manifest in a fresh Pipeline (simulating crash recovery)
+        man2 = self.make_man()
+        ctl = make_fake_ctl()
+        cfg = make_cfg(self.state_path, "--daily-limit", "1000", "--max-inflight-bytes", "0")
+        pipe = Pipeline(ctl, man2, cfg, clock=lambda: t_now)
+        pipe.cloud = "115|acc1"
+
+        qs = pipe.quota_status("115|acc1", t_now)
+        self.assertEqual(qs.confirmed_real, 600)
+        self.assertEqual(qs.reserved_inflight, 300)
+
+        # Remaining is 100 B, so c.mkv (200 B) must NOT be submitted after restart
+        pipe.submit_pending([])
+        self.assertEqual(man2.recs["c.mkv"]["state"], "pending")
+
+    def test_account_swap_and_dest_change_settle_unsettled_landed_before_switchback(self):
+        man = self.make_man()
+        r_real = man.add(make_file("/123/real.mkv", size=600))
+        r_unk = man.add(make_file("/123/unk.mkv", size=400))
+        r_rapid = man.add(make_file("/123/rapid.mkv", size=500))
+        r_next = man.add(make_file("/123/next.mkv", size=200))
+        man.set_batch([
+            (r_real, "landed", {"cloud": "115|accA", "dest_root": "/115", "landed_at": 1000, "upload_kind": "real", "quota_bytes": None}),
+            (r_unk, "landed", {"cloud": "115|accA", "dest_root": "/115", "landed_at": 1000, "upload_kind": "unknown", "quota_bytes": None}),
+            (r_rapid, "landed", {"cloud": "115|accA", "dest_root": "/115", "landed_at": 1000, "upload_kind": "rapid", "quota_bytes": None}),
+        ])
+        ctl = make_fake_ctl()
+        cfg = make_cfg(self.state_path, "--daily-limit", "1000", "--max-inflight-bytes", "0")
+        pipe = Pipeline(ctl, man, cfg, clock=lambda: 1010.0)
+        pipe.cloud = "115|accA"
+        pipe._should_wake(self._push_upload("/115/real.mkv", pb.UploadFileInfo.Transfer, transfered=100, size=600))
+
+        # Swap to accB: real(600) + unknown(400) settled on accA, rapid(500) -> 0, _upload_obs cleared
+        pipe.rotated("115|accB")
+        pipe.cloud = "115|accB"
+        self.assertEqual(r_real["quota_bytes"], 600)
+        self.assertEqual(r_unk["quota_bytes"], 400)
+        self.assertEqual(r_rapid["quota_bytes"], 0)
+        self.assertEqual(pipe._upload_obs, {})
+        self.assertEqual(pipe.quota_status("115|accA", 1010.0).confirmed_real, 1000)
+        self.assertEqual(pipe.quota_status("115|accB", 1010.0).confirmed_real, 0)
+
+        # Switch back to accA: accA is still at 1000/1000 so r_next cannot bypass daily_limit
+        pipe.cloud = "115|accA"
+        pipe.submit_pending([])
+        self.assertEqual(r_next["state"], "pending")
+
+        # Also verify dest_root change in clear_landed settles quota on original account
+        man2 = Manifest(os.path.join(self.tmp.name, "dest_change.jsonl"), "/123", "/115_new")
+        self.addCleanup(man2.close)
+        r_old_dest = man2.add(make_file("/123/old_dest.mkv", size=700))
+        man2.set(r_old_dest, "landed", cloud="115|accA", dest_root="/115_old", landed_at=1000, upload_kind="real", quota_bytes=None)
+        pipe2 = Pipeline(ctl, man2, make_cfg(man2.path, "--dest", "/115_new", "--daily-limit", "1000"), clock=lambda: 1010.0)
+        pipe2.cloud = "115|accA"
+        pipe2.clear_landed()
+        self.assertEqual(r_old_dest["state"], "dropped")
+        self.assertEqual(r_old_dest["quota_bytes"], 700)
+        self.assertEqual(pipe2.quota_status("115|accA", 1010.0).confirmed_real, 700)
+
+    def test_observe_upload_changes_filters_scope_operator_and_non_transfer_states(self):
+        man = self.make_man()
+        ctl = make_fake_ctl()
+        pipe = Pipeline(ctl, man, make_cfg(self.state_path), clock=lambda: 1000.0)
+        changes = [
+            pb.UploadFileInfo(destPath="/other/a.mkv", size=100, transferedBytes=50, operatorType=pb.UploadFileInfo.Copy, statusEnum=pb.UploadFileInfo.Transfer),
+            pb.UploadFileInfo(destPath="/115/sub/b.mkv", size=100, transferedBytes=0, operatorType=pb.UploadFileInfo.Copy, statusEnum=pb.UploadFileInfo.Finish),
+            pb.UploadFileInfo(destPath="/1152/c.mkv", size=100, transferedBytes=0, operatorType=pb.UploadFileInfo.Copy, statusEnum=pb.UploadFileInfo.Finish),
+            pb.UploadFileInfo(destPath="/115/d.mkv", size=100, transferedBytes=100, operatorType=pb.UploadFileInfo.Mount, statusEnum=pb.UploadFileInfo.Transfer),
+            pb.UploadFileInfo(destPath="/115/e.mkv", size=100, transferedBytes=0, operatorType=pb.UploadFileInfo.Copy, statusEnum=pb.UploadFileInfo.WaitforPreprocessing),
+            pb.UploadFileInfo(destPath="/115/f.mkv", size=100, transferedBytes=0, operatorType=pb.UploadFileInfo.Copy, statusEnum=pb.UploadFileInfo.Inqueue),
+            pb.UploadFileInfo(destPath="/115/g.mkv", size=100, transferedBytes=0, operatorType=pb.UploadFileInfo.Copy, statusEnum=pb.UploadFileInfo.Cancelled),
+            pb.UploadFileInfo(destPath="/115/h.mkv", size=100, transferedBytes=0, operatorType=pb.UploadFileInfo.Copy, statusEnum=pb.UploadFileInfo.Error),
+        ]
+        pipe._observe_upload_changes(changes)
+        self.assertEqual(pipe._upload_obs, {})
+
+    def test_windows_backslash_destpath_recognizes_rapid_upload(self):
+        man = self.make_man()
+        r1 = man.add(make_file("/123/win1.mkv", size=500))
+        r2 = man.add(make_file("/123/win2.mkv", size=300))
+        ctl = make_fake_ctl()
+        pipe = Pipeline(ctl, man, make_cfg(self.state_path, "--daily-limit", "1000"), clock=lambda: 1000.0)
+        pipe.cloud = "115|acc1"
+        pipe.submit_pending([])
+
+        pipe._should_wake(self._push_upload("\\115\\win1.mkv", pb.UploadFileInfo.Finish, transfered=0, size=500))
+        pipe._should_wake(self._push_upload("115\\win2.mkv", pb.UploadFileInfo.Finish, transfered=0, size=300))
+        pipe.harvest_completed([
+            make_task("/123/win1.mkv", total_bytes=500, uploaded_bytes=500),
+            make_task("/123/win2.mkv", total_bytes=300, uploaded_bytes=300),
+        ])
+        ctl.find.side_effect = lambda p: make_file(p, size=500 if p.endswith("win1.mkv") else 300)
+        pipe.clear_landed()
+        self.assertEqual(r1["upload_kind"], "rapid")
+        self.assertEqual(r1["quota_bytes"], 0)
+        self.assertEqual(r2["upload_kind"], "rapid")
+        self.assertEqual(r2["quota_bytes"], 0)
+
+    def test_same_basename_consecutive_rounds_delayed_finish_size_mismatch_fails_closed(self):
+        man = self.make_man()
+        r1 = man.add(make_file("/123/d1/dup.mkv", size=100))
+        r2 = man.add(make_file("/123/d2/dup.mkv", size=500))
+        ctl = make_fake_ctl()
+        pipe = Pipeline(ctl, man, make_cfg(self.state_path, "--daily-limit", "1000"), clock=lambda: 1000.0)
+        pipe.cloud = "115|acc1"
+
+        # Round 1 completes and clears
+        pipe.submit_pending([])
+        self.assertEqual(r1["state"], "submitted")
+        self.assertEqual(r2["state"], "pending")
+        pipe._should_wake(self._push_upload("/115/dup.mkv", pb.UploadFileInfo.Finish, transfered=0, size=100))
+        pipe.harvest_completed([make_task("/123/d1/dup.mkv", total_bytes=100, uploaded_bytes=100)])
+        ctl.find.return_value = make_file("/115/dup.mkv", size=100)
+        pipe.clear_landed()
+        self.assertEqual(r1["quota_bytes"], 0)
+
+        # Round 2 submits; delayed Finish(0, size=100) from Round 1 arrives
+        ctl.find.return_value = None
+        pipe.submit_pending([])
+        self.assertEqual(r2["state"], "submitted")
+        pipe._should_wake(self._push_upload("/115/dup.mkv", pb.UploadFileInfo.Finish, transfered=0, size=100))
+        pipe.harvest_completed([make_task("/123/d2/dup.mkv", total_bytes=500, uploaded_bytes=500)])
+        ctl.find.return_value = make_file("/115/dup.mkv", size=500)
+        pipe.clear_landed()
+        # Size mismatch (100 != 500) must reject rapid and Fail-Closed charge 500
+        self.assertEqual(r2["upload_kind"], "unknown")
+        self.assertEqual(r2["quota_bytes"], 500)
+
+    def test_rolling_24h_exact_boundary_releases_without_spin(self):
+        man = self.make_man()
+        a = man.add(make_file("/123/a.mkv", size=600))
+        b = man.add(make_file("/123/b.mkv", size=400))
+        c = man.add(make_file("/123/c.mkv", size=500))
+        man.set_batch([
+            (a, "dropped", {"cloud": "115|acc1", "dest_root": "/115", "landed_at": 1000, "upload_kind": "real", "quota_bytes": 600}),
+            (b, "dropped", {"cloud": "115|acc1", "dest_root": "/115", "landed_at": 2000, "upload_kind": "real", "quota_bytes": 400}),
+        ])
+        ctl = make_fake_ctl()
+        rclock = [1000.0 + 86400.0 - 0.5]
+        cfg = make_cfg(self.state_path, "--daily-limit", "1000", "--quota-window", "rolling-24h")
+        pipe = Pipeline(ctl, man, cfg, clock=lambda: rclock[0])
+        pipe.cloud = "115|acc1"
+
+        self.assertEqual(pipe.next_quota_wakeup("115|acc1", rclock[0]), 1000.0 + 86400.0)
+        # At exact wakeup boundary ev_ts + 86400.0, a slides out immediately (no spin)
+        rclock[0] = 1000.0 + 86400.0
+        self.assertEqual(pipe.quota_status("115|acc1", rclock[0]).confirmed_real, 400)
+        self.assertIsNone(pipe.next_quota_wakeup("115|acc1", rclock[0]))
+        pipe.submit_pending([])
+        self.assertEqual(c["state"], "submitted")
+
+    def test_restart_due_parks_oversized_enforces_max_inflight_and_computes_wakeup(self):
+        man = self.make_man()
+        r_huge = man.add(make_file("/123/huge.mkv", size=1200))
+        r_cross = man.add(make_file("/123/cross.mkv", size=300))
+        r_active = man.add(make_file("/123/active.mkv", size=200))
+        r_done = man.add(make_file("/123/done.mkv", size=800))
+        man.set_batch([
+            (r_huge, "submitted", {"cloud": "115|acc1", "dest_root": "/115", "quota_bytes": None}),
+            (r_cross, "submitted", {"cloud": "115|acc0", "dest_root": "/115", "quota_bytes": None}),
+            (r_active, "submitted", {"cloud": "115|acc1", "dest_root": "/115", "quota_bytes": None}),
+            (r_done, "dropped", {"cloud": "115|acc1", "dest_root": "/115", "landed_at": 1000, "upload_kind": "real", "quota_bytes": 800}),
+        ])
+        ctl = make_fake_ctl()
+        cfg = make_cfg(
+            self.state_path,
+            "--daily-limit", "1000",
+            "--max-inflight-bytes", "350",
+            "--quota-window", "rolling-24h",
+        )
+        pipe = Pipeline(ctl, man, cfg, clock=lambda: 2000.0)
+        pipe.cloud = "115|acc1"
+
+        # Case 1: oversized parked & cross-account blocked by daily_limit -> next_quota_wakeup works even with no pending
+        pipe.due = [(r_huge, "err", "/115"), (r_cross, "err", "/115")]
+        pipe.restart_due()
+        self.assertEqual(r_huge["state"], "failed")
+        self.assertEqual(r_huge["quota_bytes"], 0)
+        ctl.remove_tasks.assert_called_once_with(["/123/huge.mkv:/115"])
+        ctl.restart_task.assert_not_called()
+        self.assertEqual(pipe.next_quota_wakeup("115|acc1", 2000.0), 1000.0 + 86400.0)
+
+        # Case 2: daily_limit has room (move r_done out of window), but cross-account extra=300 exceeds max_inflight_bytes (200+300 > 350)
+        man.set(r_done, "dropped", landed_at=100, quota_bytes=0)
+        pipe.due = [(r_cross, "err", "/115")]
+        pipe.restart_due()
+        ctl.restart_task.assert_not_called()
+
+    def test_gone_already_submitted_mode_charges_size(self):
+        man = self.make_man()
+        r_unk = man.add(make_file("/123/gone_unk.mkv", size=300))
+        r_rapid = man.add(make_file("/123/gone_rapid.mkv", size=200))
+        man.set_batch([
+            (r_unk, "landed", {"cloud": "115|acc1", "dest_root": "/115", "landed_at": 100, "upload_kind": "unknown", "quota_bytes": None}),
+            (r_rapid, "landed", {"cloud": "115|acc1", "dest_root": "/115", "landed_at": 100, "upload_kind": "rapid", "quota_bytes": None}),
+        ])
+        ctl = make_fake_ctl()
+        ctl.find.return_value = None
+        cfg = make_cfg(self.state_path, "--missing-grace", "10", "--quota-mode", "submitted")
+        pipe = Pipeline(ctl, man, cfg, clock=lambda: 120.0)
+        pipe.cloud = "115|acc1"
+        pipe.clear_landed()
+        pipe.clear_landed()
+        self.assertEqual(r_unk["state"], "dropped")
+        self.assertEqual(r_unk["quota_bytes"], 300)
+        self.assertEqual(r_rapid["state"], "dropped")
+        self.assertEqual(r_rapid["quota_bytes"], 200)
+
+    def test_record_clear_failure_stall_stranded_clears_obs_and_persists_quota(self):
+        man = self.make_man()
+        r_unk = man.add(make_file("/123/fail_unk.mkv", size=400))
+        r_rapid = man.add(make_file("/123/fail_rapid.mkv", size=300))
+        man.set_batch([
+            (r_unk, "landed", {"cloud": "115|acc1", "dest_root": "/115", "landed_at": 100, "upload_kind": "unknown", "quota_bytes": None}),
+            (r_rapid, "landed", {"cloud": "115|acc1", "dest_root": "/115", "landed_at": 100, "upload_kind": "rapid", "quota_bytes": None}),
+        ])
+        ctl = make_fake_ctl()
+        cfg = make_cfg(self.state_path, "--stall", "10")
+        pipe = Pipeline(ctl, man, cfg, clock=lambda: 100.0)
+        pipe.cloud = "115|acc1"
+        pipe._should_wake(self._push_upload("/115/fail_unk.mkv", pb.UploadFileInfo.Transfer, transfered=50, size=400))
+        pipe._should_wake(self._push_upload("/115/fail_rapid.mkv", pb.UploadFileInfo.Finish, transfered=0, size=300))
+
+        pipe._record_clear_failure(r_unk, 100.0, "io err")
+        pipe._record_clear_failure(r_rapid, 100.0, "io err")
+        pipe._record_clear_failure(r_unk, 115.0, "io err")
+        pipe._record_clear_failure(r_rapid, 115.0, "io err")
+
+        self.assertEqual(r_unk["state"], "stranded")
+        self.assertEqual(r_unk["quota_bytes"], 400)
+        self.assertEqual(r_rapid["state"], "stranded")
+        self.assertEqual(r_rapid["quota_bytes"], 0)
+        self.assertEqual(pipe._upload_obs, {})
+
+        # Verify persisted in manifest on disk
+        man.close()
+        with Manifest(self.state_path, "/123", "/115") as reloaded:
+            self.assertEqual(reloaded.recs["fail_unk.mkv"]["quota_bytes"], 400)
+            self.assertEqual(reloaded.recs["fail_rapid.mkv"]["quota_bytes"], 0)
+
+    def test_legacy_done_records_without_quota_bytes_fail_closed(self):
+        import json
+
+        legacy = {
+            "rel": "legacy.mkv",
+            "root": "/123",
+            "src": "/123/legacy.mkv",
+            "size": 700,
+            "state": "dropped",
+            "attempts": 0,
+            "submit_fails": 0,
+            "cloud": "115|acc1",
+            "dest_root": "/115",
+            "submitted_at": 900,
+            "landed_at": 950,
+            "ts": 960,
+        }
+        with open(self.state_path, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(legacy) + "\n")
+
+        man = self.make_man()
+        r_new = man.add(make_file("/123/new.mkv", size=400))
+        ctl = make_fake_ctl()
+        cfg = make_cfg(self.state_path, "--daily-limit", "1000", "--quota-window", "rolling-24h")
+        pipe = Pipeline(ctl, man, cfg, clock=lambda: 1000.0)
+        pipe.cloud = "115|acc1"
+
+        qs = pipe.quota_status("115|acc1", 1000.0)
+        self.assertEqual(qs.confirmed_real, 700)
+        self.assertEqual(qs.window_events, ((950.0, 700),))
+        pipe.submit_pending([])
+        self.assertEqual(r_new["state"], "pending")
+
+
 if __name__ == "__main__":
     unittest.main()

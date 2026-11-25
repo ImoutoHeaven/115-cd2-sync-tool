@@ -207,6 +207,8 @@ class Manifest:
                         "dest_root": "",
                         "submitted_at": 0,
                         "landed_at": 0,
+                        "upload_kind": "",
+                        "quota_bytes": None,
                         "ts": now,
                     }
                     staged_new[rel] = r
@@ -218,6 +220,8 @@ class Manifest:
                         "state": "pending",
                         "attempts": 0,
                         "submit_fails": 0,
+                        "upload_kind": "",
+                        "quota_bytes": 0,
                         "src": src,
                         "size": f.size,
                         "ts": now,

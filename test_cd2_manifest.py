@@ -402,9 +402,67 @@ class ManifestTest(unittest.TestCase):
             PERSIST_FIELDS,
             (
                 "rel", "root", "src", "size", "state", "attempts", "submit_fails",
-                "cloud", "dest_root", "submitted_at", "landed_at", "ts",
+                "cloud", "dest_root", "submitted_at", "landed_at", "upload_kind",
+                "quota_bytes", "ts",
             ),
         )
+
+    def test_quota_fields_persistence_and_legacy_compat(self):
+        legacy = {
+            "rel": "old.mkv",
+            "root": "/src",
+            "src": "/src/old.mkv",
+            "size": 500,
+            "state": "dropped",
+            "attempts": 0,
+            "submit_fails": 0,
+            "cloud": "115|acc1",
+            "dest_root": "/115",
+            "submitted_at": 100,
+            "landed_at": 120,
+            "ts": 125,
+        }
+        with open(self.path, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(legacy) + "\n")
+
+        with Manifest(self.path, "/src", "/115") as man:
+            self.assertIn("old.mkv", man.recs)
+            self.assertIsNone(man.recs["old.mkv"].get("quota_bytes"))
+            r = man.add(fake_file("/src/new.mkv", 1000))
+            self.assertEqual(r["upload_kind"], "")
+            self.assertIsNone(r["quota_bytes"])
+            man.set(r, "dropped", upload_kind="rapid", quota_bytes=0, landed_at=200)
+
+        with Manifest(self.path, "/src", "/115") as reloaded:
+            self.assertEqual(reloaded.recs["new.mkv"]["upload_kind"], "rapid")
+            self.assertEqual(reloaded.recs["new.mkv"]["quota_bytes"], 0)
+            self.assertEqual(reloaded.recs["new.mkv"]["landed_at"], 200)
+            self.assertIsNone(reloaded.recs["old.mkv"].get("quota_bytes"))
+
+    def test_add_revives_failed_without_modifying_done(self):
+        with Manifest(self.path, "/src", "/115") as man:
+            r_fail = man.add(fake_file("/src/fail.mkv", 200))
+            r_done = man.add(fake_file("/src/done.mkv", 300))
+            man.set_batch([
+                (r_fail, "failed", {"attempts": 3, "submit_fails": 2, "upload_kind": "real", "quota_bytes": 200}),
+                (r_done, "dropped", {"upload_kind": "real", "quota_bytes": 300, "landed_at": 500}),
+            ])
+
+            revived = man.add(fake_file("/src/fail.mkv", 250))
+            untouched = man.add(fake_file("/src/done.mkv", 999))
+
+            self.assertEqual(revived["state"], "pending")
+            self.assertEqual(revived["attempts"], 0)
+            self.assertEqual(revived["submit_fails"], 0)
+            self.assertEqual(revived["upload_kind"], "")
+            self.assertEqual(revived["quota_bytes"], 0)
+            self.assertEqual(revived["size"], 250)
+
+            self.assertEqual(untouched["state"], "dropped")
+            self.assertEqual(untouched["size"], 300)
+            self.assertEqual(untouched["upload_kind"], "real")
+            self.assertEqual(untouched["quota_bytes"], 300)
+            self.assertEqual(untouched["landed_at"], 500)
 
 
 if __name__ == "__main__":

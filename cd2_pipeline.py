@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import threading
 import time
+from typing import Callable
 
 import grpc
 
@@ -16,11 +18,17 @@ from cd2_core import (
     Config,
     ThrottleGate,
     base_of,
+    fmt_bytes,
     is_throttle_error,
     log,
     mount_of,
+    next_utc8_midnight,
+    normalize_path,
+    quota_window_start,
     ts_of,
     uploaded,
+    utc8_date_str,
+    utc8_time_str,
 )
 from cd2_manifest import Manifest
 
@@ -57,6 +65,26 @@ def _pick_task(cands: list, expected_size: int | None = None):
     return max(cands, key=lambda t: _task_rank(t, expected_size=expected_size))
 
 
+def _norm_dest_path(path: str) -> str:
+    if not path:
+        return ""
+    p = path.replace("\\", "/")
+    if not p.startswith("/"):
+        p = "/" + p
+    try:
+        return normalize_path(p)
+    except ValueError:
+        return p.rstrip("/")
+
+
+@dataclass(frozen=True)
+class QuotaStatus:
+    confirmed_real: int
+    reserved_inflight: int
+    rapid_saved: int
+    window_events: tuple[tuple[float, int], ...]
+
+
 class Pipeline:
     """Fast/slow dual-cadence pipeline: submit -> poll -> batch-recycle -> prune."""
 
@@ -68,6 +96,7 @@ class Pipeline:
         man: Manifest,
         cfg: Config,
         gate: ThrottleGate | None = None,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         self.ctl = ctl
         self.man = man
@@ -77,6 +106,7 @@ class Pipeline:
             if gate is not None
             else ThrottleGate(base=cfg.throttle_base, max_backoff=cfg.throttle_max)
         )
+        self._clock = clock
         self.trigger = threading.Event()
         self.stop = threading.Event()
         self.dropped = 0
@@ -89,13 +119,17 @@ class Pipeline:
         self.more = False
         self.why: str | None = None
         self.due: list[tuple[dict, str, str]] = []
+        self._quota_deferred_due: list[dict] = []
 
         # Volatile runtime state isolated from Manifest records (keyed by rel).
         self._rt: dict[str, dict] = {}
+        self._obs_lock = threading.Lock()
+        self._upload_obs: dict[str, dict] = {}
         self._dest_checked_at = 0.0
         self._dest_cached_why: str | None = None
         self._rotated_this_step = False
         self._auth_error: AuthExpiredError | None = None
+        self._quota_wakeup_at: float | None = None
 
         self._stream_lock = threading.Lock()
         self._stream = None
@@ -104,16 +138,154 @@ class Pipeline:
         self._last_copy_count: int | None = None
         self._slow_requested = threading.Event()
 
+    def _now(self) -> float:
+        return self._clock() if self._clock is not None else time.time()
+
     def _rt_of(self, rel: str) -> dict:
         return self._rt.setdefault(rel, {})
 
+    def _dest_path_of(self, r: dict) -> str:
+        return _norm_dest_path(f"{self.man.dest_root}/{base_of(r['src'])}")
+
     def invalidate_dest_cache(self) -> None:
         self._dest_checked_at = 0.0
+
+    # --- Rapid vs real upload observation & quota ledger -------------------
+
+    def _observe_upload_changes(self, changes) -> None:
+        dest_prefix = f"{self.man.dest_root.rstrip('/')}/"
+        with self._obs_lock:
+            for u in changes:
+                p = _norm_dest_path(u.destPath)
+                if (
+                    not p
+                    or u.operatorType != pb.UploadFileInfo.Copy
+                    or not p.startswith(dest_prefix)
+                    or "/" in p[len(dest_prefix) :]
+                ):
+                    continue
+                if u.statusEnum == pb.UploadFileInfo.Transfer or u.transferedBytes > 0:
+                    obs = self._upload_obs.setdefault(p, {"saw_transfer": False, "kind": "", "size": 0})
+                    obs["saw_transfer"] = True
+                    obs["kind"] = "real"
+                    obs["size"] = u.size
+                elif u.statusEnum == pb.UploadFileInfo.Finish:
+                    obs = self._upload_obs.setdefault(p, {"saw_transfer": False, "kind": "", "size": 0})
+                    obs["size"] = u.size
+                    if obs["saw_transfer"] or obs["kind"] == "real":
+                        obs["kind"] = "real"
+                    else:
+                        obs["kind"] = "rapid"
+
+    def _peek_upload_kind(self, dest_path: str, expected_size: int | None = None) -> str:
+        p = _norm_dest_path(dest_path)
+        with self._obs_lock:
+            obs = self._upload_obs.get(p)
+            if not obs:
+                return ""
+            if obs.get("saw_transfer") or obs.get("kind") == "real":
+                return "real"
+            if obs.get("kind") == "rapid":
+                if expected_size is not None and obs.get("size", 0) != expected_size:
+                    return ""
+                return "rapid"
+            return ""
+
+    def _clear_upload_obs(self, dest_path: str) -> None:
+        p = _norm_dest_path(dest_path)
+        with self._obs_lock:
+            self._upload_obs.pop(p, None)
+
+    def _resolve_upload_kind(self, r: dict, dest_path: str) -> str:
+        kind = r.get("upload_kind") or ""
+        obs_kind = self._peek_upload_kind(dest_path, expected_size=r["size"])
+        if obs_kind == "real" or kind == "real":
+            return "real"
+        if kind == "rapid" or obs_kind == "rapid":
+            return "rapid"
+        return "unknown"
+
+    def _calc_quota_bytes(self, r: dict, upload_kind: str) -> int:
+        if self.cfg.quota_mode == "submitted":
+            return r["size"]
+        return 0 if upload_kind == "rapid" else r["size"]
+
+    def quota_status(self, account: str | None = None, now: float | None = None) -> QuotaStatus:
+        acc = self.cloud if account is None else account
+        if not acc:
+            return QuotaStatus(0, 0, 0, ())
+        ts_now = self._now() if now is None else now
+        win_start = quota_window_start(ts_now, self.cfg.quota_window)
+        rolling = self.cfg.quota_window == "rolling-24h"
+        confirmed = 0
+        reserved = 0
+        rapid_saved = 0
+        events: list[tuple[float, int]] = []
+        with self.man.lock:
+            recs = list(self.man.recs.values())
+        for r in recs:
+            if r.get("cloud") != acc:
+                continue
+            st = r["state"]
+            qb = r.get("quota_bytes")
+            if st == "submitted" or (st == "landed" and qb is None):
+                reserved += r["size"]
+            elif st == "landed" or st in DONE:
+                ev_ts = r.get("landed_at") or r.get("ts") or 0
+                if ev_ts > win_start if rolling else ev_ts >= win_start:
+                    # Legacy manifest DONE records without quota_bytes default Fail-Closed to size.
+                    eff_qb = r["size"] if qb is None else qb
+                    confirmed += eff_qb
+                    if eff_qb > 0:
+                        events.append((float(ev_ts), eff_qb))
+                    if r.get("upload_kind") == "rapid" and eff_qb == 0:
+                        rapid_saved += r["size"]
+        return QuotaStatus(confirmed, reserved, rapid_saved, tuple(events))
+
+    def next_quota_wakeup(
+        self,
+        account: str | None = None,
+        now: float | None = None,
+        qs: QuotaStatus | None = None,
+    ) -> float | None:
+        if self.cfg.daily_limit <= 0:
+            return None
+        acc = self.cloud if account is None else account
+        if not acc:
+            return None
+        ts_now = self._now() if now is None else now
+        candidates = [
+            r["size"] for r in self.man.of("pending") if r["size"] <= self.cfg.daily_limit
+        ]
+        if not candidates:
+            due_recs = [r for r, _, _ in self.due] or self._quota_deferred_due
+            candidates = [
+                0 if r.get("cloud") == acc else r["size"]
+                for r in due_recs
+                if r["state"] == "submitted" and r["size"] <= self.cfg.daily_limit
+            ]
+        if not candidates:
+            return None
+        need = candidates[0] if self.cfg.quota_fit == "strict" else min(candidates)
+        st = qs if qs is not None else self.quota_status(acc, ts_now)
+        if st.confirmed_real + st.reserved_inflight + need <= self.cfg.daily_limit:
+            return None
+        if self.cfg.quota_window == "daily-utc8":
+            return next_utc8_midnight(ts_now)
+        deficit = (st.confirmed_real + st.reserved_inflight + need) - self.cfg.daily_limit
+        acc_freed = 0
+        for ev_ts, qb in sorted(st.window_events, key=lambda x: x[0]):
+            acc_freed += qb
+            if acc_freed >= deficit:
+                return ev_ts + 86400.0
+        return None
 
     # --- PushMessage listener ----------------------------------------------
 
     def _should_wake(self, msg: pb.CloudDrivePushMessage) -> bool:
         mtype = msg.messageType
+        if msg.HasField("transferTaskStatus"):
+            self._observe_upload_changes(msg.transferTaskStatus.uploadFileStatusChanges)
         if mtype in (
             pb.CloudDrivePushMessage.COPY_TASK_COUNT,
             pb.CloudDrivePushMessage.UPLOADER_COUNT,
@@ -303,13 +475,18 @@ class Pipeline:
     def rotated(self, account: str) -> None:
         """Persist fresh retry budgets and drop old-account landed entries."""
         log(f"destination account is now {account} (was {self.cloud}); resuming")
-        self.rotated_at = time.time()
+        self.rotated_at = self._now()
         self._rotated_this_step = True
         self._dest_checked_at = 0.0
+        self._quota_wakeup_at = None
+        self._quota_deferred_due = []
         updates: list[tuple[dict, str, dict]] = []
         for r in self.man.of("failed"):
-            updates.append((r, "pending", {"attempts": 0, "submit_fails": 0}))
+            updates.append(
+                (r, "pending", {"attempts": 0, "submit_fails": 0, "upload_kind": "", "quota_bytes": 0})
+            )
             self._rt.pop(r["rel"], None)
+            self._clear_upload_obs(self._dest_path_of(r))
         for r in self.man.of("pending"):
             updates.append((r, "pending", {"attempts": 0, "submit_fails": 0}))
         for r in self.man.of("submitted"):
@@ -319,9 +496,17 @@ class Pipeline:
                 rt["failed_at"] = 1
         for r in self.man.of("landed"):
             if not r.get("cloud") or r["cloud"] != account:
-                updates.append((r, "dropped", {}))
+                path = self._dest_path_of(r)
+                kind = self._resolve_upload_kind(r, path)
+                qb = (
+                    r["quota_bytes"]
+                    if r.get("quota_bytes") is not None
+                    else self._calc_quota_bytes(r, kind)
+                )
+                updates.append((r, "dropped", {"upload_kind": kind, "quota_bytes": qb}))
                 self.dropped += 1
                 self._rt.pop(r["rel"], None)
+                self._clear_upload_obs(path)
                 log(f"gone with previous account/dest {r['rel']}")
         self.man.set_batch(updates)
 
@@ -342,9 +527,17 @@ class Pipeline:
         if rt["retry"] in (1, 5, 50):
             log(f"wait {r['rel']}: {why} (x{rt['retry']})")
         if now - rt["clear_since"] >= self.cfg.stall:
-            self.man.set(r, "stranded")
+            path = self._dest_path_of(r)
+            kind = self._resolve_upload_kind(r, path)
+            qb = (
+                r["quota_bytes"]
+                if r.get("quota_bytes") is not None
+                else self._calc_quota_bytes(r, kind)
+            )
+            self.man.set(r, "stranded", upload_kind=kind, quota_bytes=qb)
             self.stranded += 1
             self._rt.pop(r["rel"], None)
+            self._clear_upload_obs(path)
             log(f"stranded {r['rel']}: could not clear the landed copy ({why})")
 
     def _mark_dropped_batch(self, items: list[tuple[dict, str]]) -> None:
@@ -479,29 +672,32 @@ class Pipeline:
         if not landed:
             return
 
-        now = time.time()
+        now = self._now()
         instant_updates: list[tuple[dict, str, dict]] = []
         to_delete: list[tuple[dict, str]] = []
         throttled = False
 
         for r in landed:
+            path = f"{self.man.dest_root}/{base_of(r['src'])}"
             if (bool(r.get("dest_root")) and r["dest_root"] != self.man.dest_root) or (
                 r.get("cloud") and self.cloud and r["cloud"] != self.cloud
             ):
-                instant_updates.append((r, "dropped", {}))
+                obs_path = _norm_dest_path(
+                    f"{r.get('dest_root') or self.man.dest_root}/{base_of(r['src'])}"
+                )
+                kind = self._resolve_upload_kind(r, obs_path)
+                qb = (
+                    r["quota_bytes"]
+                    if r.get("quota_bytes") is not None
+                    else self._calc_quota_bytes(r, kind)
+                )
+                instant_updates.append((r, "dropped", {"upload_kind": kind, "quota_bytes": qb}))
                 self.dropped += 1
                 self._rt.pop(r["rel"], None)
+                self._clear_upload_obs(obs_path)
                 log(f"gone with previous account/dest {r['rel']}")
                 continue
 
-            if self.cfg.delete == "none":
-                instant_updates.append((r, "kept", {}))
-                self.kept += 1
-                self._rt.pop(r["rel"], None)
-                log(f"ok {r['rel']} ({r['size']} B, left in place)")
-                continue
-
-            path = f"{self.man.dest_root}/{base_of(r['src'])}"
             try:
                 f = self.ctl.find(path)
             except grpc.RpcError as e:
@@ -520,21 +716,44 @@ class Pipeline:
                 rt["miss_count"] = rt.get("miss_count", 0) + 1
                 landed_at = r.get("landed_at") or r.get("ts") or 0
                 if (now - landed_at) >= self.cfg.missing_grace and rt["miss_count"] >= 2:
-                    instant_updates.append((r, "dropped", {}))
+                    kind = self._resolve_upload_kind(r, path)
+                    if r.get("quota_bytes") is not None:
+                        qb = r["quota_bytes"]
+                    elif self.cfg.quota_mode == "submitted" or kind == "real":
+                        qb = r["size"]
+                    else:
+                        qb = 0
+                    instant_updates.append((r, "dropped", {"upload_kind": kind, "quota_bytes": qb}))
                     self.dropped += 1
                     self._rt.pop(r["rel"], None)
+                    self._clear_upload_obs(path)
                     log(f"gone already {r['rel']}")
                 continue
 
+            kind = self._resolve_upload_kind(r, path)
+            qb = (
+                r["quota_bytes"]
+                if r.get("quota_bytes") is not None
+                else self._calc_quota_bytes(r, kind)
+            )
+            self._clear_upload_obs(path)
+
             if f.isDirectory or f.size != r["size"]:
-                instant_updates.append((r, "stranded", {}))
+                instant_updates.append((r, "stranded", {"upload_kind": kind, "quota_bytes": qb}))
                 self.stranded += 1
                 self._rt.pop(r["rel"], None)
                 log(f"{r['rel']} landed under another name/size; left on 115")
                 continue
 
+            if self.cfg.delete == "none":
+                instant_updates.append((r, "kept", {"upload_kind": kind, "quota_bytes": qb}))
+                self.kept += 1
+                self._rt.pop(r["rel"], None)
+                log(f"ok {r['rel']} ({r['size']} B, left in place)")
+                continue
+
             if self.cfg.delete == "permanent" and not f.canDeletePermanently:
-                instant_updates.append((r, "stranded", {}))
+                instant_updates.append((r, "stranded", {"upload_kind": kind, "quota_bytes": qb}))
                 self.stranded += 1
                 self._rt.pop(r["rel"], None)
                 log(f"stranded {r['rel']}: permanent delete not supported on destination")
@@ -543,6 +762,9 @@ class Pipeline:
             rt = self._rt.get(r["rel"])
             if rt is not None:
                 rt.pop("miss_count", None)
+            if r.get("quota_bytes") is None:
+                # Settle quota before DeleteFiles so rapid uploads release reservation immediately.
+                instant_updates.append((r, "landed", {"upload_kind": kind, "quota_bytes": qb}))
             to_delete.append((r, path))
 
         if instant_updates:
@@ -568,8 +790,9 @@ class Pipeline:
         )
 
     def _park(self, r: dict, why: str, task_keys: list[str] | None = None) -> None:
-        self.man.set(r, "failed")
+        self.man.set(r, "failed", upload_kind="", quota_bytes=0)
         self._rt.pop(r["rel"], None)
+        self._clear_upload_obs(self._dest_path_of(r))
         keys = task_keys if task_keys else [f"{r['src']}:{self.man.dest_root}"]
         self.ctl.remove_tasks(keys)
         log(f"parked {r['rel']}: {why}")
@@ -584,7 +807,7 @@ class Pipeline:
 
     def harvest_completed(self, tasks: list) -> int:
         """Pure-local harvest of newly completed CopyTasks -> landed."""
-        now = time.time()
+        now = self._now()
         by_src = self.man.by_src()
         grouped = _group_tasks(tasks, self.man.dest_root)
         updates: list[tuple[dict, str, dict]] = []
@@ -597,7 +820,8 @@ class Pipeline:
                 continue
             if r["state"] == "failed" and not self.ours(r, best):
                 continue
-            updates.append((r, "landed", {"landed_at": int(now)}))
+            kind = self._peek_upload_kind(self._dest_path_of(r), expected_size=r["size"]) or "unknown"
+            updates.append((r, "landed", {"landed_at": int(now), "upload_kind": kind, "quota_bytes": None}))
             self._rt.pop(r["rel"], None)
             for t in cands:
                 self.prune.add(f"{t.sourcePath}:{t.destPath}")
@@ -606,7 +830,7 @@ class Pipeline:
         return len(updates)
 
     def poll_tasks(self, tasks: list, ready: bool = True) -> set[str]:
-        now = time.time()
+        now = self._now()
         by_src = self.man.by_src()
         grouped = _group_tasks(tasks, self.man.dest_root)
         seen: set[str] = set()
@@ -627,7 +851,10 @@ class Pipeline:
             rt["seen"] = now
 
             if uploaded(best, expected_size=r["size"]):
-                landed_updates.append((r, "landed", {"landed_at": int(now)}))
+                kind = self._peek_upload_kind(self._dest_path_of(r), expected_size=r["size"]) or "unknown"
+                landed_updates.append(
+                    (r, "landed", {"landed_at": int(now), "upload_kind": kind, "quota_bytes": None})
+                )
                 self._rt.pop(r["rel"], None)
                 for t in cands:
                     self.prune.add(f"{t.sourcePath}:{t.destPath}")
@@ -660,10 +887,18 @@ class Pipeline:
             self._park(r, why, task_keys=[f"{r['src']}:{target_dest}"])
             return
         log(f"retry {r['rel']} (attempt {r['attempts'] + 1}): {why}")
-        self.man.set(r, "submitted", attempts=r["attempts"] + 1, cloud=self.cloud)
+        self._clear_upload_obs(self._dest_path_of(r))
+        self.man.set(
+            r,
+            "submitted",
+            attempts=r["attempts"] + 1,
+            cloud=self.cloud,
+            upload_kind="",
+            quota_bytes=None,
+        )
         rt = self._rt_of(r["rel"])
         rt["failed_at"] = 0
-        rt["seen"] = time.time()
+        rt["seen"] = self._now()
         try:
             self.ctl.restart_task(r["src"], target_dest)
         except grpc.RpcError as e:
@@ -671,14 +906,53 @@ class Pipeline:
 
     def restart_due(self) -> None:
         due, self.due = self.due, []
+        self._quota_deferred_due = []
+        if not due:
+            return
+        qs = self.quota_status(self.cloud)
+        reserved = qs.reserved_inflight
         cap = self.cfg.batch if self.cfg.batch > 0 else len(due)
-        for r, msg, dest_path in due[:cap]:
-            if r["state"] == "submitted":
-                self._retry(r, msg, dest_path=dest_path)
-        self.more = self.more or len(due) > cap
+        started = 0
+        for r, msg, dest_path in due:
+            if r["state"] != "submitted":
+                continue
+            if self.cfg.daily_limit > 0 and r["size"] > self.cfg.daily_limit:
+                if r.get("cloud") == self.cloud:
+                    reserved = max(0, reserved - r["size"])
+                self._park(
+                    r,
+                    f"file size {fmt_bytes(r['size'])} exceeds daily limit "
+                    f"{fmt_bytes(self.cfg.daily_limit)}",
+                    task_keys=[f"{r['src']}:{dest_path or self.man.dest_root}"],
+                )
+                continue
+            if started >= cap:
+                self.more = True
+                break
+            extra = 0 if r.get("cloud") == self.cloud else r["size"]
+            if self.cfg.daily_limit > 0 and (
+                qs.confirmed_real >= self.cfg.daily_limit
+                or (qs.confirmed_real + reserved + extra) > self.cfg.daily_limit
+            ):
+                self._quota_deferred_due.append(r)
+                if self.cfg.quota_fit == "strict":
+                    break
+                continue
+            if (
+                extra > 0
+                and self.cfg.max_inflight_bytes > 0
+                and reserved > 0
+                and (reserved + extra) > self.cfg.max_inflight_bytes
+            ):
+                if self.cfg.quota_fit == "strict":
+                    break
+                continue
+            reserved += extra
+            self._retry(r, msg, dest_path=dest_path)
+            started += 1
 
     def reconcile(self, seen: set[str]) -> None:
-        now = time.time()
+        now = self._now()
         for r in self.man.of("submitted"):
             if r["src"] in seen:
                 continue
@@ -686,16 +960,18 @@ class Pipeline:
             last = rt.get("seen") or r.get("submitted_at") or r.get("ts", 0)
             moved = bool(self.cloud and r.get("cloud") and r["cloud"] != self.cloud)
             if last < self.rotated_at or moved:
-                self.man.set(r, "pending")
+                self.man.set(r, "pending", upload_kind="", quota_bytes=0)
                 self._rt.pop(r["rel"], None)
+                self._clear_upload_obs(self._dest_path_of(r))
                 log(f"task lost with the previous account, requeue {r['rel']}")
             elif now - last < self.cfg.stall:
                 continue
             elif r["attempts"] >= self.cfg.max_attempts:
                 self._park(r, f"task vanished {int(now - last)}s ago")
             else:
-                self.man.set(r, "pending", attempts=r["attempts"] + 1)
+                self.man.set(r, "pending", attempts=r["attempts"] + 1, upload_kind="", quota_bytes=0)
                 self._rt.pop(r["rel"], None)
+                self._clear_upload_obs(self._dest_path_of(r))
                 log(f"task vanished, requeue {r['rel']}")
 
     def submit_pending(self, tasks: list) -> None:
@@ -706,23 +982,47 @@ class Pipeline:
             if r["src"] in grouped:
                 lanes.add(base_of(r["src"]))
 
+        qs = self.quota_status(self.cloud)
+        confirmed = qs.confirmed_real
+        reserved = qs.reserved_inflight
+
         pending = self.man.of("pending")
         cap = self.cfg.batch if self.cfg.batch > 0 else len(pending)
         batch: list[dict] = []
         for r in pending:
             if len(batch) >= cap:
                 break
+            if self.cfg.daily_limit > 0 and r["size"] > self.cfg.daily_limit:
+                self._park(
+                    r,
+                    f"file size {fmt_bytes(r['size'])} exceeds daily limit "
+                    f"{fmt_bytes(self.cfg.daily_limit)}",
+                )
+                continue
             b = base_of(r["src"])
             if b in lanes:
                 continue
+            if self.cfg.daily_limit > 0 and (confirmed + reserved + r["size"]) > self.cfg.daily_limit:
+                if self.cfg.quota_fit == "strict":
+                    break
+                continue
+            if (
+                self.cfg.max_inflight_bytes > 0
+                and reserved > 0
+                and (reserved + r["size"]) > self.cfg.max_inflight_bytes
+            ):
+                if self.cfg.quota_fit == "strict":
+                    break
+                continue
             lanes.add(b)
+            reserved += r["size"]
             batch.append(r)
         if not batch:
             return
 
         ok_n = 0
         to_submit: list[dict] = []
-        now = time.time()
+        now = self._now()
 
         for r in batch:
             cands = grouped.get(r["src"])
@@ -744,6 +1044,8 @@ class Pipeline:
                         submitted_at=int(started or now),
                         cloud=self.cloud,
                         submit_fails=0,
+                        upload_kind="",
+                        quota_bytes=None,
                     )
                     rt = self._rt_of(r["rel"])
                     rt["seen"] = now
@@ -859,14 +1161,17 @@ class Pipeline:
                 ready_to_submit = [r for r in ready_to_submit if r["rel"] not in blocked_rels]
 
         for r in ready_to_submit:
-            now = time.time()
+            now = self._now()
             had_fails = r.get("submit_fails", 0) != 0
+            self._clear_upload_obs(self._dest_path_of(r))
             self.man.set(
                 r,
                 "submitted",
                 dest_root=self.man.dest_root,
                 submitted_at=int(now),
                 cloud=self.cloud,
+                upload_kind="",
+                quota_bytes=None,
             )
             rt = self._rt_of(r["rel"])
             rt["seen"] = now
@@ -883,7 +1188,7 @@ class Pipeline:
                     self.man.set(r, "submitted", submit_fails=0)
                 ok_n += 1
             else:
-                self.man.set(r, "pending", submitted_at=0)
+                self.man.set(r, "pending", submitted_at=0, upload_kind="", quota_bytes=0)
                 self.bump(r, f"submit rejected: {err}")
 
         left = len(self.man.of("pending"))
@@ -919,6 +1224,7 @@ class Pipeline:
     def slow_step(self, force_dest: bool = False) -> None:
         self.more = False
         self.due = []
+        self._quota_deferred_due = []
         self._rotated_this_step = False
         self.ctl.keep_login()
         why = self.dest_ready(force=force_dest)
@@ -946,10 +1252,16 @@ class Pipeline:
 
     def run(self) -> int:
         threading.Thread(target=self.listen, daemon=True).start()
+        quota_desc = (
+            f"daily-limit={fmt_bytes(self.cfg.daily_limit)} "
+            f"window={self.cfg.quota_window} mode={self.cfg.quota_mode}"
+            if self.cfg.daily_limit > 0
+            else "daily-limit=unlimited"
+        )
         log(
             f"{self.man.src_root} (read-only) -> {self.man.dest_root} | "
             f"after-landing={self.cfg.delete} delete-interval={self.cfg.delete_interval}s "
-            f"sweep={self.cfg.sweep}s"
+            f"sweep={self.cfg.sweep}s | {quota_desc}"
         )
         next_slow = 0.0
         next_fast = 0.0
@@ -959,8 +1271,14 @@ class Pipeline:
                 force_slow = self._slow_requested.is_set()
                 if force_slow:
                     self._slow_requested.clear()
+                wall_now = self._now()
+                quota_due = (
+                    self._quota_wakeup_at is not None and wall_now >= self._quota_wakeup_at
+                )
+                if quota_due:
+                    self._quota_wakeup_at = None
                 now = time.monotonic()
-                if self.more or force_slow or now >= next_slow:
+                if self.more or force_slow or quota_due or now >= next_slow:
                     self.slow_step(force_dest=force_slow)
                     after = time.monotonic()
                     next_slow = after + self.cfg.sweep
@@ -982,14 +1300,42 @@ class Pipeline:
                         f"{self.kept} kept, {self.stranded} stranded"
                     )
                     return 0
+
+                wall_now = self._now()
+                qs = self.quota_status(self.cloud, wall_now)
+                wakeup = self.next_quota_wakeup(self.cloud, wall_now, qs)
+                self._quota_wakeup_at = wakeup
+
+                quota_info = ""
+                if self.cfg.daily_limit > 0 and self.cloud:
+                    win_label = (
+                        "rolling-24h"
+                        if self.cfg.quota_window == "rolling-24h"
+                        else utc8_date_str(wall_now)
+                    )
+                    quota_info = (
+                        f" | quota[{self.cloud} {win_label}] "
+                        f"real={fmt_bytes(qs.confirmed_real)}/{fmt_bytes(self.cfg.daily_limit)} "
+                        f"inflight={fmt_bytes(qs.reserved_inflight)} "
+                        f"rapid_free={fmt_bytes(qs.rapid_saved)}"
+                    )
+                    if wakeup is not None:
+                        quota_info += (
+                            f" (paused until {utc8_time_str(wakeup)} or account swap)"
+                        )
+
                 log(
                     f"progress {done}/{total} | pending {len(self.man.of('pending'))} "
                     f"submitted {len(self.man.of('submitted'))} landed {len(self.man.of('landed'))} "
                     f"parked {parked}{' (waiting for another 115 account)' if outstanding == 0 else ''}"
+                    f"{quota_info}"
                 )
                 if self.more:
                     continue
                 wait = max(0.0, min(next_slow, next_fast) - time.monotonic())
+                if wakeup is not None:
+                    rem_quota = max(0.0, wakeup - self._now())
+                    wait = min(wait, rem_quota)
                 if self.gate.in_cooldown() and self.man.of("landed"):
                     rem = self.gate.remaining()
                     if rem > 0:

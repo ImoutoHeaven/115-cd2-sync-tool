@@ -16,17 +16,22 @@ from cd2_core import (
     LIVE,
     MANIFEST_FIELDS,
     RETRY,
+    UTC8,
     VALID_STATES,
     WORKING,
     Config,
     ThrottleGate,
     base_of,
     channel_target,
+    fmt_bytes,
     is_throttle_error,
     mount_of,
+    next_utc8_midnight,
     normalize_path,
     parse_args,
+    parse_bytes,
     paths_overlap,
+    quota_window_start,
     ts_of,
     uploaded,
 )
@@ -61,7 +66,8 @@ class ConstantsAndPathTest(unittest.TestCase):
             MANIFEST_FIELDS,
             (
                 "rel", "root", "src", "size", "state", "attempts", "submit_fails",
-                "cloud", "dest_root", "submitted_at", "landed_at", "ts",
+                "cloud", "dest_root", "submitted_at", "landed_at", "upload_kind",
+                "quota_bytes", "ts",
             ),
         )
 
@@ -450,6 +456,95 @@ class ParseArgsTest(unittest.TestCase):
             self.assertEqual(cfg.throttle_max, 5.0)
             self.assertEqual(cfg.delete_batch, 1)
             self.assertEqual(cfg.max_attempts, 1)
+
+    def test_quota_flags_defaults_env_and_validation(self):
+        with self._clean_env():
+            cfg = parse_args(["run", "--src", "/src/a", "--dest", "/115"])
+            self.assertEqual(cfg.daily_limit, 800 * 1000**3)
+            self.assertEqual(cfg.quota_window, "daily-utc8")
+            self.assertEqual(cfg.quota_mode, "real")
+            self.assertEqual(cfg.max_inflight_bytes, 128 * 1000**3)
+            self.assertEqual(cfg.quota_fit, "first")
+
+        env = {
+            "CD2_DAILY_LIMIT": "500GB",
+            "CD2_QUOTA_WINDOW": "rolling-24h",
+            "CD2_QUOTA_MODE": "submitted",
+            "CD2_MAX_INFLIGHT_BYTES": "64GiB",
+            "CD2_QUOTA_FIT": "strict",
+        }
+        with self._clean_env(**env):
+            cfg = parse_args(["run", "--src", "/src/a", "--dest", "/115"])
+            self.assertEqual(cfg.daily_limit, 500 * 1000**3)
+            self.assertEqual(cfg.quota_window, "rolling-24h")
+            self.assertEqual(cfg.quota_mode, "submitted")
+            self.assertEqual(cfg.max_inflight_bytes, 64 * 1024**3)
+            self.assertEqual(cfg.quota_fit, "strict")
+
+            cfg2 = parse_args([
+                "run", "--src", "/src/a", "--dest", "/115",
+                "--daily-limit", "0", "--max-inflight-bytes", "0",
+                "--quota-window", "daily-utc8", "--quota-mode", "real", "--quota-fit", "first",
+            ])
+            self.assertEqual(cfg2.daily_limit, 0)
+            self.assertEqual(cfg2.max_inflight_bytes, 0)
+            self.assertEqual(cfg2.quota_window, "daily-utc8")
+            self.assertEqual(cfg2.quota_mode, "real")
+            self.assertEqual(cfg2.quota_fit, "first")
+
+        base = ["run", "--src", "/src/a", "--dest", "/115"]
+        with self._clean_env():
+            for bad in (
+                base + ["--daily-limit=-1G"],
+                base + ["--daily-limit=0.5B"],
+                base + ["--daily-limit", "10XB"],
+                base + ["--max-inflight-bytes", "abc"],
+                base + ["--quota-window", "utc0"],
+                base + ["--quota-mode", "rapid"],
+                base + ["--quota-fit", "best"],
+            ):
+                with self.assertRaises(SystemExit, msg=repr(bad)):
+                    parse_args(bad)
+
+
+class ByteAndWindowTest(unittest.TestCase):
+    def test_parse_bytes_decimal_binary_and_errors(self):
+        self.assertEqual(parse_bytes(0), 0)
+        self.assertEqual(parse_bytes("0"), 0)
+        self.assertEqual(parse_bytes("0G"), 0)
+        self.assertEqual(parse_bytes("12345"), 12345)
+        self.assertEqual(parse_bytes("100B"), 100)
+        self.assertEqual(parse_bytes("1K"), 1000)
+        self.assertEqual(parse_bytes("1KB"), 1000)
+        self.assertEqual(parse_bytes("2.5M"), 2_500_000)
+        self.assertEqual(parse_bytes("2.5MB"), 2_500_000)
+        self.assertEqual(parse_bytes("800G"), 800_000_000_000)
+        self.assertEqual(parse_bytes("800gb"), 800_000_000_000)
+        self.assertEqual(parse_bytes("1.5T"), 1_500_000_000_000)
+        self.assertEqual(parse_bytes("1TB"), 1_000_000_000_000)
+        self.assertEqual(parse_bytes("1KiB"), 1024)
+        self.assertEqual(parse_bytes("2MiB"), 2 * 1024**2)
+        self.assertEqual(parse_bytes("800GiB"), 800 * 1024**3)
+        self.assertEqual(parse_bytes("1TiB"), 1024**4)
+        self.assertEqual(fmt_bytes(800_000_000_000), "800.00GB")
+        self.assertEqual(fmt_bytes(0), "0B")
+
+        for bad in ("", " ", "-5", "-1G", "0.5B", "0.0001K", "10PB", "1.2.3G", True, -1):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                parse_bytes(bad)
+
+    def test_utc8_and_rolling_window(self):
+        import datetime
+
+        t_before = datetime.datetime(2026, 5, 10, 23, 59, 50, tzinfo=UTC8).timestamp()
+        t_after = datetime.datetime(2026, 5, 11, 0, 0, 5, tzinfo=UTC8).timestamp()
+        start_day1 = datetime.datetime(2026, 5, 10, 0, 0, 0, tzinfo=UTC8).timestamp()
+        start_day2 = datetime.datetime(2026, 5, 11, 0, 0, 0, tzinfo=UTC8).timestamp()
+
+        self.assertEqual(quota_window_start(t_before, "daily-utc8"), start_day1)
+        self.assertEqual(next_utc8_midnight(t_before), start_day2)
+        self.assertEqual(quota_window_start(t_after, "daily-utc8"), start_day2)
+        self.assertEqual(quota_window_start(t_before, "rolling-24h"), t_before - 86400.0)
 
 
 if __name__ == "__main__":

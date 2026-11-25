@@ -138,6 +138,20 @@ In `cloudapi.dll`, the 115open delete implementation targets `https://proapi.115
 
 Consequently, `FindFileByPath` + `DeleteFiles` can operate directly against the locally synchronized `dir_cache` with **zero** extra 115 list API calls. Calling `ForceExpireDirCache` or `GetSubFiles(forceRefresh=True)` during aggressive 115 recycle deletion is unnecessary and only wastes 115open QPS.
 
+### 4. Rapid Upload (秒传) vs Real Upload in `UploadFileInfo` (`cloudapi.dll`)
+
+Decompilation of `cloudapi.dll` confirms that CloudDrive2 separates rapid-upload preprocessing from real data transfer:
+- **Rapid-upload worker (`0x1801d4db2`)**: Invokes 115 `rapid_upload` (`0x180861d91`, `/open/upload/init` with `file_name`, `file_size`, `fileid`, `preid`, `sign_key`, `sign_val`, `pick_code`; 0-byte files skip rapid upload). On a rapid-upload hit (tag `0x8000000000000048`), it updates local `dir_cache` (`sub_1801873BA`) and immediately sets `UploadFileInfo.statusEnum` to `Finish (5)` (`sub_180C34BF3`), completely bypassing `0x1801d2b51`, never entering `Transfer (3)`, and leaving `transferedBytes` (`task + 512`) at `0`.
+- **Real-upload worker (`0x1801d2b51`)**: Immediately sets `UploadFileInfo.statusEnum` to `Transfer (3)`, increments `transferedBytes` during upload, then updates `dir_cache` and sets `Finish (5)` upon completion.
+- **`UploadFileInfo` proto (`sub_180C3FB1B`)**: Serializes `size` (`sub_180C36890`) and `transferedBytes` (`sub_180C35367`), allowing `PushMessage` (`uploadFileStatusChanges`) to distinguish rapid uploads (`Finish (5)` with `transferedBytes == 0` and no prior `Transfer (3)`) from real uploads (`Transfer (3)` or `transferedBytes > 0`).
+
+### Quota Ledger & Pre-GC Settlement
+
+The pipeline enforces per-account daily real-upload limits (`--daily-limit`, default `800G` decimal; `--quota-window`, default `daily-utc8`; `--quota-mode`, default `real`; `--max-inflight-bytes`, default `128G`; `--quota-fit`, default `first`) directly on `manifest.jsonl` via `landed_at`, `upload_kind`, and `quota_bytes`:
+- Submissions require `confirmed_real_bytes(account, window) + reserved_inflight_bytes(account) + size <= daily_limit` (where `reserved_inflight_bytes` sums `submitted` records and unsettled `landed` records with `quota_bytes is None`).
+- `clear_landed` verifies local `dir_cache` via `FindFileByPath` before `DeleteFiles` (and before `--delete none` transitions to `kept`) and settles `quota_bytes`: rotated account/destination records settle immediately before `FindFileByPath` via `_calc_quota_bytes` (`0` for `rapid` in `real` mode, or `size` otherwise); verified matches and `stranded` mismatches settle via `_calc_quota_bytes` the same way; `NOT_FOUND` records expiring `--missing-grace` settle `size` if `--quota-mode submitted` or `upload_kind == "real"`, or `0` otherwise.
+- When an account hits its limit, `submit_pending` and `restart_due` pause while `fast_step()`, `keep_login()`, and `dest_ready()` remain active in the foreground, resuming automatically on an account swap or when the next UTC+8 day / `rolling-24h` slot opens.
+
 ## Pipeline Engine Architecture
 
 The transfer pump is split into five modules (`cd2_core.py`, `cd2_client.py`, `cd2_manifest.py`, `cd2_pipeline.py`, `cd2_stream.py`) driving CloudDrive2 without modifying the source tree.
